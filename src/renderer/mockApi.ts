@@ -1,0 +1,184 @@
+import type {
+  AppState,
+  CodexSwitchApi,
+  OperationResult,
+  ProfileTag,
+  PublicProfile,
+  SaveProfileInput,
+  TestProfileInput,
+  UpdateProfileTagsInput
+} from "../shared/types";
+
+const mockTags: ProfileTag[] = [
+  { id: "stability-high", name: "稳定程度高", metric: "stability", level: "high", color: "#2aa84a" },
+  { id: "stability-medium", name: "稳定程度中", metric: "stability", level: "medium", color: "#d99a20" },
+  { id: "stability-low", name: "稳定程度低", metric: "stability", level: "low", color: "#c4362a" },
+  { id: "price-high", name: "价格高", metric: "price", level: "high", color: "#c4362a" },
+  { id: "price-medium", name: "价格中", metric: "price", level: "medium", color: "#d99a20" },
+  { id: "price-low", name: "价格低", metric: "price", level: "low", color: "#2aa84a" },
+  { id: "dilution-high", name: "掺水率高", metric: "dilution", level: "high", color: "#c4362a" },
+  { id: "dilution-medium", name: "掺水率中", metric: "dilution", level: "medium", color: "#d99a20" },
+  { id: "dilution-low", name: "掺水率低", metric: "dilution", level: "low", color: "#2aa84a" },
+  { id: "speed-high", name: "速度高", metric: "speed", level: "high", color: "#2aa84a" },
+  { id: "speed-medium", name: "速度中", metric: "speed", level: "medium", color: "#d99a20" },
+  { id: "speed-low", name: "速度低", metric: "speed", level: "low", color: "#c4362a" }
+];
+
+const names = ["YunDu Relay", "OpenRouter", "SiliconFlow", "DeepSeek", "Moonshot AI", "Zhipu AI", "Groq Edge", "Team Relay"];
+const hosts = ["api.yundu.lat", "openrouter.ai", "siliconflow.cn", "deepseek.com", "moonshot.cn", "bigmodel.cn", "groq.com", "relay.team.local"];
+const colors = ["#5d61d8", "#5577f2", "#33bc88", "#ff7b4a", "#8158e8", "#7f5af0", "#f07352", "#36a3a1"];
+
+function makeProfile(index: number): PublicProfile {
+  const host = hosts[index];
+  const tagIds = [
+    index % 3 === 2 ? "stability-medium" : "stability-high",
+    index % 4 === 0 ? "price-high" : index % 2 === 0 ? "price-low" : "price-medium",
+    index % 3 === 0 ? "dilution-low" : "dilution-medium",
+    index % 2 === 0 ? "speed-high" : "speed-medium"
+  ];
+
+  return {
+    id: `mock-${index + 1}`,
+    name: names[index],
+    baseUrl: `https://${host}/v1`,
+    normalizedBaseUrl: `https://${host}/v1`,
+    host,
+    origin: `https://${host}`,
+    iconUrl: "",
+    iconCandidates: [],
+    color: colors[index],
+    known: index < 7,
+    apiKeyPreview: `sk-${String(index + 1).padStart(2, "0")}...demo`,
+    apiKeyHash: `hash-${index + 1}`,
+    createdAt: new Date(2026, 5, 20 + index).toISOString(),
+    updatedAt: new Date(2026, 5, 21 + index).toISOString(),
+    lastAppliedAt: index === 1 ? new Date(2026, 5, 26, 16, 32).toISOString() : undefined,
+    tagIds,
+    isActive: index === 1,
+    testStatus: index % 5 === 4 ? "failed" : index % 3 === 1 ? "idle" : "ok",
+    lastTestedAt: new Date(2026, 5, 26, 15, 18 + index).toISOString(),
+    lastTestMessage: index % 5 === 4 ? "连接超时" : undefined
+  };
+}
+
+let mockState: AppState = {
+  profiles: names.map((_, index) => makeProfile(index)),
+  tags: mockTags,
+  current: {
+    codexHome: "C:\\Users\\demo\\.codex",
+    envPath: "C:\\Users\\demo\\.codex\\.env",
+    configPath: "C:\\Users\\demo\\.codex\\config.toml",
+    providerName: "OpenRouter",
+    baseUrl: "https://openrouter.ai/v1",
+    envKeyName: "OPENAI_API_KEY",
+    hasApiKey: true,
+    apiKeyPreview: "sk-02...demo",
+    matchedProfileId: "mock-2"
+  },
+  storagePath: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\profiles.json",
+  backupRoot: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\backups"
+};
+
+function detect(input: string) {
+  const normalizedBaseUrl = input.startsWith("http") ? input : `https://${input}`;
+  const url = new URL(normalizedBaseUrl);
+  const host = url.host.toLowerCase();
+  const name = host.split(".").filter(Boolean)[0] || "Custom Relay";
+  return {
+    normalizedBaseUrl,
+    host,
+    origin: url.origin,
+    name: name.slice(0, 1).toUpperCase() + name.slice(1),
+    iconUrl: "",
+    iconCandidates: [],
+    color: "#5d61d8",
+    known: false
+  };
+}
+
+function result(message: string, profile?: PublicProfile): OperationResult {
+  return {
+    ok: true,
+    message,
+    state: mockState,
+    profile
+  };
+}
+
+export function createMockCodexSwitchApi(): CodexSwitchApi {
+  return {
+    getState: async () => mockState,
+    detectProvider: async (baseUrl: string) => detect(baseUrl),
+    saveProfile: async (input: SaveProfileInput) => {
+      const detection = detect(input.baseUrl);
+      const existing = input.id ? mockState.profiles.find((profile) => profile.id === input.id) : undefined;
+      const profile: PublicProfile = {
+        ...(existing || makeProfile(7)),
+        ...detection,
+        id: existing?.id || crypto.randomUUID(),
+        baseUrl: detection.normalizedBaseUrl,
+        name: input.name?.trim() || detection.name,
+        apiKeyPreview: input.apiKey ? `${input.apiKey.slice(0, 5)}...${input.apiKey.slice(-4)}` : existing?.apiKeyPreview || "sk-new...demo",
+        tagIds: input.tagIds || existing?.tagIds || [],
+        updatedAt: new Date().toISOString()
+      };
+      mockState = {
+        ...mockState,
+        profiles: existing
+          ? mockState.profiles.map((item) => (item.id === existing.id ? profile : item))
+          : [profile, ...mockState.profiles]
+      };
+      return result(existing ? "配置已更新" : "配置已创建", profile);
+    },
+    applyProfile: async (profileId: string) => {
+      const nextProfiles = mockState.profiles.map((profile) => ({
+        ...profile,
+        isActive: profile.id === profileId,
+        lastAppliedAt: profile.id === profileId ? new Date().toISOString() : profile.lastAppliedAt
+      }));
+      const active = nextProfiles.find((profile) => profile.id === profileId);
+      mockState = {
+        ...mockState,
+        profiles: nextProfiles,
+        current: {
+          ...mockState.current,
+          baseUrl: active?.baseUrl,
+          apiKeyPreview: active?.apiKeyPreview,
+          matchedProfileId: active?.id
+        }
+      };
+      return result("已切换配置", active);
+    },
+    deleteProfile: async (profileId: string) => {
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.filter((profile) => profile.id !== profileId)
+      };
+      return result("配置已删除");
+    },
+    updateProfileTags: async (input: UpdateProfileTagsInput) => {
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.map((profile) =>
+          profile.id === input.profileId ? { ...profile, tagIds: input.tagIds } : profile
+        )
+      };
+      return result("标签已更新");
+    },
+    importCurrentConfig: async () => result("已导入当前配置", mockState.profiles[0]),
+    testProfile: async (input: TestProfileInput) => {
+      const profileId = input.profileId;
+      const message = input.profileId ? "GET mock.relay/v1/models 返回 200，耗时 128ms" : "GET preview.relay/v1/models 返回 200，耗时 128ms";
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.map((profile) =>
+          profile.id === profileId
+            ? { ...profile, testStatus: "ok", lastTestedAt: new Date().toISOString(), lastTestMessage: message }
+            : profile
+        )
+      };
+      return result(message);
+    },
+    revealPath: async () => undefined
+  };
+}

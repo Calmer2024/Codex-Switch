@@ -1,0 +1,60 @@
+{
+  "name": "codex-switch",
+  "version": "0.1.0",
+  "description": "A Windows desktop tool for switching Codex relay configurations.",
+  "author": "Codex Switch",
+  "private": true,
+  "main": "out/main/index.js",
+  "productName": "Codex Switch",
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite dev\"",
+    "preview": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite preview\"",
+    "build": "tsc --noEmit && electron-vite build",
+    "dist": "npm run build && electron-builder --win portable",
+    "pack": "npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.4",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.5.2",
+    "electron": "^36.4.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "build": {
+    "appId": "dev.codex-switch.app",
+    "productName": "Codex Switch",
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "portable"
+      ],
+      "signExecutable": false
+    },
+    "portable": {
+      "artifactName": "Codex Switch ${version}.exe"
+    }
+  }
+}
