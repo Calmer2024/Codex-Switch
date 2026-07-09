@@ -10,8 +10,12 @@
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite dev\"",
     "preview": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite preview\"",
     "build": "tsc --noEmit && electron-vite build",
-    "dist": "npm run build && electron-builder --win portable",
-    "pack": "npm run build && electron-builder --dir"
+    "prepare:local-update": "node scripts/write-dev-update-config.mjs",
+    "dist": "npm run prepare:local-update && npm run build && electron-builder --win nsis portable",
+    "dist:installer": "npm run prepare:local-update && npm run build && electron-builder --win nsis",
+    "dist:portable": "npm run prepare:local-update && npm run build && electron-builder --win portable",
+    "dist:install": "npm run dist:installer && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$installer = Get-ChildItem -Path .\\release -Filter '*Setup*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $installer) { throw 'Installer not found' }; Start-Process -FilePath $installer.FullName -Wait\"",
+    "pack": "npm run prepare:local-update && npm run build && electron-builder --dir"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
@@ -44,14 +48,28 @@
       {
         "from": "build/icon.ico",
         "to": "icon.ico"
+      },
+      {
+        "from": "build/dev-update.json",
+        "to": "dev-update.json"
       }
     ],
     "win": {
       "icon": "build/icon.ico",
       "target": [
+        "nsis",
         "portable"
       ],
       "signExecutable": false
+    },
+    "nsis": {
+      "artifactName": "Codex-Switch-Setup-${version}.${ext}",
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Codex Switch",
+      "runAfterFinish": true
     },
     "portable": {
       "artifactName": "Codex Switch ${version}.exe"

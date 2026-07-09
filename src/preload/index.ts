@@ -10,7 +10,12 @@ const api: CodexSwitchApi = {
   updateProfileTags: (input: UpdateProfileTagsInput) => ipcRenderer.invoke("codex-switch:update-profile-tags", input),
   importCurrentConfig: () => ipcRenderer.invoke("codex-switch:import-current"),
   testProfile: (input: TestProfileInput) => ipcRenderer.invoke("codex-switch:test-profile", input),
-  revealPath: (kind: "codexHome" | "storage" | "backupRoot") => ipcRenderer.invoke("codex-switch:reveal-path", kind)
+  refreshUsage: () => ipcRenderer.invoke("codex-switch:refresh-usage"),
+  connectDashboardAuth: (profileId: string) => ipcRenderer.invoke("codex-switch:connect-dashboard-auth", profileId),
+  checkLocalUpdate: () => ipcRenderer.invoke("codex-switch:check-local-update"),
+  installLocalUpdate: () => ipcRenderer.invoke("codex-switch:install-local-update"),
+  revealPath: (kind: "codexHome" | "storage" | "backupRoot") => ipcRenderer.invoke("codex-switch:reveal-path", kind),
+  openExternal: (url: string) => ipcRenderer.invoke("codex-switch:open-external", url)
 };
 
 contextBridge.exposeInMainWorld("codexSwitch", api);

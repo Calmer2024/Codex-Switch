@@ -27,6 +27,55 @@ const mockTags: ProfileTag[] = [
 const names = ["YunDu Relay", "OpenRouter", "SiliconFlow", "DeepSeek", "Moonshot AI", "Zhipu AI", "Groq Edge", "Team Relay"];
 const hosts = ["api.yundu.lat", "openrouter.ai", "siliconflow.cn", "deepseek.com", "moonshot.cn", "bigmodel.cn", "groq.com", "relay.team.local"];
 const colors = ["#5d61d8", "#5577f2", "#33bc88", "#ff7b4a", "#8158e8", "#7f5af0", "#f07352", "#36a3a1"];
+const OFFICIAL_PROFILE_ID = "official-codex-chatgpt";
+
+const officialProfile: PublicProfile = {
+  id: OFFICIAL_PROFILE_ID,
+  kind: "official",
+  builtin: true,
+  name: "官方 Codex",
+  baseUrl: "codex login",
+  normalizedBaseUrl: "codex login",
+  host: "chatgpt.com",
+  origin: "https://chatgpt.com",
+  iconUrl: "",
+  iconCandidates: [],
+  color: "#2563eb",
+  known: true,
+  apiKeyPreview: "ChatGPT 登录",
+  apiKeyHash: "",
+  createdAt: new Date(2026, 5, 20).toISOString(),
+  updatedAt: new Date(2026, 5, 20).toISOString(),
+  tagIds: [],
+  isActive: false,
+  testStatus: "idle",
+  usage: {
+    kind: "official",
+    status: "ok",
+    label: "官方余量",
+    value: "5小时 68% / 1周 84%",
+    updatedAt: new Date(2026, 5, 26, 16, 30).toISOString(),
+    source: "https://chatgpt.com/backend-api/wham/usage",
+    windows: [
+      {
+        id: "five-hour",
+        label: "5小时",
+        usedPercent: 32,
+        remainingPercent: 68,
+        resetAt: new Date(2026, 5, 26, 20, 0).toISOString(),
+        windowMinutes: 300
+      },
+      {
+        id: "weekly",
+        label: "1周",
+        usedPercent: 16,
+        remainingPercent: 84,
+        resetAt: new Date(2026, 6, 1, 8, 0).toISOString(),
+        windowMinutes: 10080
+      }
+    ]
+  }
+};
 
 function makeProfile(index: number): PublicProfile {
   const host = hosts[index];
@@ -39,6 +88,8 @@ function makeProfile(index: number): PublicProfile {
 
   return {
     id: `mock-${index + 1}`,
+    kind: "custom",
+    builtin: false,
     name: names[index],
     baseUrl: `https://${host}/v1`,
     normalizedBaseUrl: `https://${host}/v1`,
@@ -57,20 +108,37 @@ function makeProfile(index: number): PublicProfile {
     isActive: index === 1,
     testStatus: index % 5 === 4 ? "failed" : index % 3 === 1 ? "idle" : "ok",
     lastTestedAt: new Date(2026, 5, 26, 15, 18 + index).toISOString(),
-    lastTestMessage: index % 5 === 4 ? "连接超时" : undefined
+    lastTestMessage: index % 5 === 4 ? "连接超时" : undefined,
+    dashboardAuth: {
+      supported: true,
+      provider: host.includes("yundu.lat") ? "yundu" : "generic",
+      connected: host.includes("yundu.lat"),
+      connectedAt: host.includes("yundu.lat") ? new Date(2026, 5, 26, 16, 10).toISOString() : undefined,
+      updatedAt: host.includes("yundu.lat") ? new Date(2026, 5, 26, 16, 18).toISOString() : undefined,
+      message: host.includes("yundu.lat") ? "已连接网页登录态" : "可连接网页登录态读取余额"
+    },
+    usage: {
+      kind: "relay",
+      status: "ok",
+      label: index % 2 === 0 ? "余额" : "剩余额度",
+      value: index % 2 === 0 ? `$${(18.5 + index * 3.2).toFixed(2)}` : `${(820000 - index * 32000).toLocaleString("zh-CN")}`,
+      updatedAt: new Date(2026, 5, 26, 16, 18 + index).toISOString(),
+      source: `https://${host}/v1/dashboard/billing/credit_grants`
+    }
   };
 }
 
 let mockState: AppState = {
-  profiles: names.map((_, index) => makeProfile(index)),
+  profiles: [officialProfile, ...names.map((_, index) => makeProfile(index))],
   tags: mockTags,
   current: {
     codexHome: "C:\\Users\\demo\\.codex",
-    envPath: "C:\\Users\\demo\\.codex\\.env",
+    authPath: "C:\\Users\\demo\\.codex\\auth.json",
     configPath: "C:\\Users\\demo\\.codex\\config.toml",
     providerName: "OpenRouter",
     baseUrl: "https://openrouter.ai/v1",
-    envKeyName: "OPENAI_API_KEY",
+    authMode: "apikey",
+    authKeyName: "OPENAI_API_KEY",
     hasApiKey: true,
     apiKeyPreview: "sk-02...demo",
     matchedProfileId: "mock-2"
@@ -142,17 +210,28 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
         profiles: nextProfiles,
         current: {
           ...mockState.current,
-          baseUrl: active?.baseUrl,
-          apiKeyPreview: active?.apiKeyPreview,
+          baseUrl: active?.builtin ? undefined : active?.baseUrl,
+          hasApiKey: !active?.builtin,
+          apiKeyPreview: active?.builtin ? undefined : active?.apiKeyPreview,
           matchedProfileId: active?.id
         }
       };
-      return result("已切换配置", active);
+      return {
+        ...result(active?.builtin ? "已切换到官方 Codex，并打开登录窗口" : "已切换配置", active),
+        loginStarted: Boolean(active?.builtin),
+        restart: {
+          needed: true,
+          attempted: false,
+          restarted: false,
+          processCount: 0,
+          message: "开发预览不会重启 Codex"
+        }
+      };
     },
     deleteProfile: async (profileId: string) => {
       mockState = {
         ...mockState,
-        profiles: mockState.profiles.filter((profile) => profile.id !== profileId)
+        profiles: mockState.profiles.filter((profile) => profile.id !== profileId || profile.builtin)
       };
       return result("配置已删除");
     },
@@ -179,6 +258,56 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
       };
       return result(message);
     },
-    revealPath: async () => undefined
+    refreshUsage: async () => {
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.map((profile) => ({
+          ...profile,
+          usage: profile.usage ? { ...profile.usage, updatedAt: new Date().toISOString() } : profile.usage
+        }))
+      };
+      return result("额度已同步");
+    },
+    connectDashboardAuth: async (profileId: string) => {
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.map((profile) =>
+          profile.id === profileId
+            ? {
+                ...profile,
+                dashboardAuth: {
+                  supported: true,
+                  provider: profile.host.includes("yundu.lat") ? "yundu" : "generic",
+                  connected: true,
+                  connectedAt: profile.dashboardAuth?.connectedAt || new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                  message: "已连接网页登录态"
+                },
+                usage: {
+                  kind: "relay",
+                  status: "ok",
+                  label: "余额",
+                  value: "$6.17",
+                  updatedAt: new Date().toISOString(),
+                  source: "https://yundu.lat/api/v1/user/profile",
+                  message: "来自云渡网页登录态"
+                }
+              }
+            : profile
+        )
+      };
+      return result("已连接网页登录态，当前余额 $6.17");
+    },
+    checkLocalUpdate: async () => ({
+      available: false,
+      currentVersion: "0.1.0",
+      message: "开发预览不安装更新"
+    }),
+    installLocalUpdate: async () => ({
+      ok: false,
+      message: "开发预览不安装更新"
+    }),
+    revealPath: async () => undefined,
+    openExternal: async () => undefined
   };
 }

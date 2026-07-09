@@ -1,6 +1,45 @@
 export type TestStatus = "idle" | "testing" | "ok" | "failed";
 export type TagMetric = "stability" | "price" | "dilution" | "speed";
 export type TagLevel = "high" | "medium" | "low";
+export type ProfileKind = "official" | "custom";
+export type UsageStatus = "unknown" | "ok" | "unsupported" | "failed";
+
+export interface UsageWindowInfo {
+  id: "five-hour" | "weekly" | string;
+  label: string;
+  usedPercent?: number;
+  remainingPercent?: number;
+  resetAt?: string;
+  windowMinutes?: number;
+}
+
+export interface ProfileUsageSummary {
+  kind: "relay" | "official";
+  status: UsageStatus;
+  label: string;
+  value: string;
+  updatedAt?: string;
+  source?: string;
+  message?: string;
+  windows?: UsageWindowInfo[];
+}
+
+export interface DashboardAuthStatus {
+  supported: boolean;
+  provider?: "yundu" | "generic";
+  connected: boolean;
+  connectedAt?: string;
+  updatedAt?: string;
+  message: string;
+}
+
+export interface CodexRestartResult {
+  needed: boolean;
+  attempted: boolean;
+  restarted: boolean;
+  processCount: number;
+  message: string;
+}
 
 export interface ProfileTag {
   id: string;
@@ -23,6 +62,8 @@ export interface ProviderDetection {
 
 export interface PublicProfile extends ProviderDetection {
   id: string;
+  kind?: ProfileKind;
+  builtin?: boolean;
   baseUrl: string;
   apiKeyPreview: string;
   apiKeyHash: string;
@@ -35,15 +76,18 @@ export interface PublicProfile extends ProviderDetection {
   testStatus?: TestStatus;
   lastTestedAt?: string;
   lastTestMessage?: string;
+  usage?: ProfileUsageSummary;
+  dashboardAuth?: DashboardAuthStatus;
 }
 
 export interface CurrentCodexConfig {
   codexHome: string;
-  envPath: string;
+  authPath: string;
   configPath: string;
   providerName?: string;
   baseUrl?: string;
-  envKeyName?: string;
+  authMode?: string;
+  authKeyName?: string;
   hasApiKey: boolean;
   apiKeyPreview?: string;
   matchedProfileId?: string;
@@ -85,6 +129,18 @@ export interface OperationResult {
   state?: AppState;
   profile?: PublicProfile;
   backupDir?: string;
+  loginStarted?: boolean;
+  restart?: CodexRestartResult;
+  localUpdate?: LocalUpdateInfo;
+}
+
+export interface LocalUpdateInfo {
+  available: boolean;
+  currentVersion: string;
+  version?: string;
+  releaseDate?: string;
+  installerPath?: string;
+  message: string;
 }
 
 export interface CodexSwitchApi {
@@ -96,5 +152,10 @@ export interface CodexSwitchApi {
   updateProfileTags: (input: UpdateProfileTagsInput) => Promise<OperationResult>;
   importCurrentConfig: () => Promise<OperationResult>;
   testProfile: (input: TestProfileInput) => Promise<OperationResult>;
+  refreshUsage: () => Promise<OperationResult>;
+  connectDashboardAuth: (profileId: string) => Promise<OperationResult>;
+  checkLocalUpdate: () => Promise<LocalUpdateInfo>;
+  installLocalUpdate: () => Promise<OperationResult>;
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => Promise<void>;
+  openExternal: (url: string) => Promise<void>;
 }

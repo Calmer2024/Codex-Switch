@@ -19,6 +19,7 @@ import {
   Lightning,
   MagicWand,
   MagnifyingGlass,
+  PencilSimple,
   Plug,
   PlusCircle,
   ShieldCheck,
@@ -42,6 +43,7 @@ type BusyAction =
   | "deleting"
   | "importing"
   | "testing"
+  | "connecting-dashboard"
   | null;
 
 type ActiveView = "overview" | "profiles" | "tags";
@@ -112,7 +114,9 @@ function App(): ReactElement {
   const [profileModalMode, setProfileModalMode] = useState<ProfileModalMode>(null);
   const [editForm, setEditForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState<BusyAction>("loading");
+  const [usageRefreshing, setUsageRefreshing] = useState(false);
   const [testingProfileId, setTestingProfileId] = useState<string | null>(null);
+  const [connectingDashboardProfileId, setConnectingDashboardProfileId] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([
@@ -130,8 +134,28 @@ function App(): ReactElement {
   );
 
   useEffect(() => {
-    void refreshState();
+    void bootstrapState();
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshUsage(false);
+    }, 120000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!toast) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setToast((current) => (current?.id === toast.id ? null : current));
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   useEffect(() => {
     const value = form.baseUrl.trim();
@@ -166,6 +190,31 @@ function App(): ReactElement {
     }
   }
 
+  async function bootstrapState(): Promise<void> {
+    await refreshState();
+    void refreshUsage(false);
+  }
+
+  async function refreshUsage(showFeedback = true): Promise<void> {
+    setUsageRefreshing(true);
+    try {
+      const result = await api.refreshUsage();
+      if (result.state) {
+        setState(result.state);
+      }
+      if (showFeedback) {
+        applyResult(result);
+        showToast({
+          tone: result.ok ? "ok" : "warn",
+          title: result.ok ? "额度已同步" : "同步失败",
+          detail: result.message
+        });
+      }
+    } finally {
+      setUsageRefreshing(false);
+    }
+  }
+
   function addLog(entry: Omit<LogEntry, "id">): void {
     setLogs((current) => [{ ...entry, id: crypto.randomUUID() }, ...current].slice(0, 5));
   }
@@ -178,10 +227,12 @@ function App(): ReactElement {
     if (result.state) {
       setState(result.state);
     }
+    const restartDetail = result.restart?.message;
+    const detail = result.ok ? [successDetail || result.backupDir, restartDetail].filter(Boolean).join(" · ") : undefined;
     addLog({
       tone: result.ok ? "ok" : "warn",
       message: result.message,
-      detail: result.ok ? successDetail || result.backupDir : undefined
+      detail
     });
   }
 
@@ -200,6 +251,9 @@ function App(): ReactElement {
       if (saved.ok && switchAfterSave && saved.profile) {
         const applied = await api.applyProfile(saved.profile.id);
         applyResult(applied, applied.backupDir ? `备份: ${applied.backupDir}` : undefined);
+        if (applied.ok) {
+          void refreshUsage(false);
+        }
       }
 
       if (saved.ok) {
@@ -237,6 +291,9 @@ function App(): ReactElement {
   }
 
   function startEditProfile(profile: PublicProfile): void {
+    if (profile.builtin) {
+      return;
+    }
     setSelectedId(profile.id);
     setProfileModalMode("edit");
     setEditingProfileId(profile.id);
@@ -298,12 +355,32 @@ function App(): ReactElement {
     try {
       const result = await api.applyProfile(profileId);
       applyResult(result, result.backupDir ? `备份: ${result.backupDir}` : undefined);
+      if (result.ok) {
+        void refreshUsage(false);
+      }
+      if (result.ok && result.loginStarted) {
+        showToast({
+          tone: "info",
+          title: "已打开官方登录",
+          detail: "请在弹出的终端里完成 codex login。"
+        });
+      } else if (result.ok && result.restart) {
+        showToast({
+          tone: result.restart.restarted ? "ok" : "info",
+          title: result.restart.restarted ? "Codex 已自动重启" : "Codex 未重启",
+          detail: result.restart.message
+        });
+      }
     } finally {
       setBusy(null);
     }
   }
 
   async function handleDelete(profile: PublicProfile): Promise<void> {
+    if (profile.builtin) {
+      return;
+    }
+
     const confirmed = window.confirm(`删除 ${profile.name} 配置？`);
     if (!confirmed) {
       return;
@@ -352,6 +429,11 @@ function App(): ReactElement {
   }
 
   async function handleTestProfile(profileId: string): Promise<void> {
+    const targetProfile = profiles.find((profile) => profile.id === profileId);
+    if (targetProfile?.builtin) {
+      return;
+    }
+
     setBusy("testing");
     setTestingProfileId(profileId);
     try {
@@ -365,6 +447,35 @@ function App(): ReactElement {
       });
     } finally {
       setTestingProfileId(null);
+      setBusy(null);
+    }
+  }
+
+  async function handleConnectDashboardAuth(profile: PublicProfile): Promise<void> {
+    if (!profile.dashboardAuth?.supported) {
+      return;
+    }
+
+    setBusy("connecting-dashboard");
+    setConnectingDashboardProfileId(profile.id);
+    showToast({
+      tone: "info",
+      title: "正在连接网页登录态",
+      detail: `请在弹出的 ${profile.name} 窗口登录，登录后会自动读取余额。`
+    });
+    try {
+      const result = await api.connectDashboardAuth(profile.id);
+      applyResult(result);
+      showToast({
+        tone: result.ok ? "ok" : "warn",
+        title: result.ok ? "余额登录已连接" : "余额登录未完成",
+        detail: result.message
+      });
+      if (result.ok) {
+        void refreshUsage(false);
+      }
+    } finally {
+      setConnectingDashboardProfileId(null);
       setBusy(null);
     }
   }
@@ -383,7 +494,13 @@ function App(): ReactElement {
     }
   }
 
+  async function handleOpenProfile(profile: PublicProfile): Promise<void> {
+    const target = profile.builtin || profile.kind === "official" ? "https://chatgpt.com/codex" : profile.origin;
+    await api.openExternal(target);
+  }
+
   const profiles = state?.profiles || [];
+  const customProfiles = profiles.filter((profile) => !profile.builtin);
   const tags = state?.tags || [];
   const current = state?.current;
   const isWorking = busy !== null;
@@ -396,14 +513,25 @@ function App(): ReactElement {
   const profilesPerPage = 8;
   const searchValue = profileSearch.trim().toLowerCase();
   const filteredProfiles = profiles.filter((profile) => {
+    const isOfficial = profile.builtin || profile.kind === "official";
     const tagNames = profile.tagIds
       .map((id) => tags.find((tag) => tag.id === id)?.name)
       .filter(Boolean)
       .join(" ");
-    const matchesTag = activeTagFilter === "all" || profile.tagIds.includes(activeTagFilter);
+    const matchesTag = activeTagFilter === "all" || (!isOfficial && profile.tagIds.includes(activeTagFilter));
     const matchesSearch =
       !searchValue ||
-      [profile.name, profile.host, profile.baseUrl, profile.normalizedBaseUrl, profile.apiKeyPreview, tagNames]
+      [
+        profile.name,
+        profile.host,
+        profile.baseUrl,
+        profile.normalizedBaseUrl,
+        profile.apiKeyPreview,
+        profile.usage?.value,
+        profile.usage?.message,
+        isOfficial ? "官方 ChatGPT 登录 codex login 官方余量 重置" : "",
+        tagNames
+      ]
         .join(" ")
         .toLowerCase()
         .includes(searchValue);
@@ -465,7 +593,7 @@ function App(): ReactElement {
           <section className="view-panel overview-view">
             <section className="overview-card">
               <div className="metric-block">
-                <strong>{profiles.length}</strong>
+                <strong>{customProfiles.length}</strong>
                 <span>已保存中转站配置</span>
               </div>
               <div className="readiness-block">
@@ -478,7 +606,15 @@ function App(): ReactElement {
                 </div>
               </div>
               <div className="overview-actions">
-                <button className="icon-action" onClick={refreshState} disabled={isWorking} title="刷新">
+                <button
+                  className="icon-action"
+                  onClick={() => {
+                    void refreshState();
+                    void refreshUsage(false);
+                  }}
+                  disabled={isWorking}
+                  title="刷新"
+                >
                   <ArrowClockwise size={18} />
                 </button>
               </div>
@@ -493,7 +629,7 @@ function App(): ReactElement {
               />
               <StatusTile
                 icon={<Key size={20} />}
-                label={current?.envKeyName || DEFAULT_KEY_LABEL}
+                label={current?.authKeyName ? `auth.json · ${current.authKeyName}` : DEFAULT_AUTH_LABEL}
                 value={current?.hasApiKey ? current.apiKeyPreview || "已设置" : "未设置"}
                 tone={current?.hasApiKey ? "ok" : "warn"}
               />
@@ -614,7 +750,7 @@ function App(): ReactElement {
             <section className="subscriptions-panel">
               <div className="subscriptions-header">
                 <div className="subscriptions-title-block">
-                  <h1>已注册中转站</h1>
+                  <h1>配置库</h1>
                   <div className="subscription-tabs" aria-label="中转站分类">
                     <button className={activeTagFilter === "all" ? "active" : ""} onClick={() => setActiveTagFilter("all")}>
                       <span>{profiles.length > 99 ? "99+" : profiles.length}</span>
@@ -638,6 +774,15 @@ function App(): ReactElement {
                   </div>
                 </div>
                 <div className="subscriptions-tools">
+                  <button
+                    className="sync-usage-button"
+                    onClick={() => void refreshUsage(true)}
+                    disabled={usageRefreshing}
+                    title="同步中转站余额与官方余量"
+                  >
+                    <ArrowClockwise size={17} className={usageRefreshing ? "spinning" : ""} />
+                    {usageRefreshing ? "同步中" : "同步额度"}
+                  </button>
                   <label className="subscription-search">
                     <MagnifyingGlass size={18} />
                     <input
@@ -656,7 +801,7 @@ function App(): ReactElement {
               </div>
 
               <div className="subscription-section-title">
-                <h2>可用中转站</h2>
+                <h2>可用配置</h2>
                 {profilePageCount > 1 && (
                   <div className="subscription-pager">
                     <button onClick={() => setProfilePage((page) => Math.max(0, page - 1))} disabled={profilePage === 0}>
@@ -676,7 +821,7 @@ function App(): ReactElement {
               {filteredProfiles.length === 0 ? (
                 <div className="empty-state library-empty">
                   <Database size={28} />
-                  <p>{profiles.length ? "这个标签下还没有中转站" : "还没有保存的中转站"}</p>
+                  <p>{profiles.length ? "这个标签下还没有配置" : "还没有保存的配置"}</p>
                 </div>
               ) : (
                 <div className="subscription-card-grid">
@@ -687,9 +832,12 @@ function App(): ReactElement {
                       tags={tags}
                       isWorking={isWorking}
                       isTesting={testingProfileId === profile.id}
+                      isConnectingDashboard={connectingDashboardProfileId === profile.id}
                       onApply={handleApply}
+                      onConnectDashboardAuth={handleConnectDashboardAuth}
                       onDelete={handleDelete}
                       onEdit={startEditProfile}
+                      onOpen={handleOpenProfile}
                       onTest={handleTestProfile}
                     />
                   ))}
@@ -702,11 +850,11 @@ function App(): ReactElement {
         {activeView === "tags" && (
           <section className="view-panel tags-view">
             <section className="panel tag-management-panel">
-              <TagManagementBoard tags={tags} profiles={profiles} />
+              <TagManagementBoard tags={tags} profiles={customProfiles} />
             </section>
 
             <section className="panel tag-insight-panel">
-              <TagInsightPanel tags={tags} profiles={profiles} />
+              <TagInsightPanel tags={tags} profiles={customProfiles} />
             </section>
           </section>
         )}
@@ -814,7 +962,7 @@ function App(): ReactElement {
   );
 }
 
-const DEFAULT_KEY_LABEL = "CODEX_API_KEY";
+const DEFAULT_AUTH_LABEL = "auth.json · OPENAI_API_KEY";
 
 function toggleMetricTag(ids: string[], id: string, tags: ProfileTag[]): string[] {
   const tag = tags.find((item) => item.id === id);
@@ -926,41 +1074,63 @@ function SubscriptionCard({
   tags,
   isWorking,
   isTesting,
+  isConnectingDashboard,
   onApply,
+  onConnectDashboardAuth,
   onDelete,
   onEdit,
+  onOpen,
   onTest
 }: {
   profile: PublicProfile;
   tags: ProfileTag[];
   isWorking: boolean;
   isTesting: boolean;
+  isConnectingDashboard: boolean;
   onApply: (profileId: string) => Promise<void>;
+  onConnectDashboardAuth: (profile: PublicProfile) => Promise<void>;
   onDelete: (profile: PublicProfile) => Promise<void>;
   onEdit: (profile: PublicProfile) => void;
+  onOpen: (profile: PublicProfile) => Promise<void>;
   onTest: (profileId: string) => Promise<void>;
 }): ReactElement {
+  const isOfficial = profile.builtin || profile.kind === "official";
   const statusTone = profile.isActive ? "active" : profile.testStatus || "idle";
   const statusText = profile.isActive ? "当前使用" : rowStatusLabel(profile);
+  const authLabel = isOfficial ? "认证方式" : "API Key";
+  const authValue = isOfficial ? "ChatGPT 登录" : profile.apiKeyPreview;
+  const endpointLabel = isOfficial ? "官方入口" : "Base URL";
+  const endpointValue = isOfficial ? "codex login" : profile.normalizedBaseUrl;
+  const canConnectDashboard = !isOfficial && profile.dashboardAuth?.supported;
+  const dashboardConnected = Boolean(profile.dashboardAuth?.connected);
 
   return (
-    <article className={`subscription-card ${statusTone}`}>
+    <article className={`subscription-card ${statusTone} ${isOfficial ? "builtin" : ""}`}>
       <div className="subscription-card-top">
         <ProviderIcon profile={profile} />
         <span>
           <strong>{profile.name}</strong>
           <small>{profile.host}</small>
         </span>
-        <button className="card-open-button" onClick={() => onEdit(profile)} title="编辑配置">
-          <ArrowUpRight size={16} />
-        </button>
+        <span className="subscription-card-tools">
+          {profile.isActive && <span className="card-current-pill">当前使用</span>}
+          {isOfficial && <span className="card-builtin-pill">官方</span>}
+          <button className="card-open-button" onClick={() => void onOpen(profile)} title={isOfficial ? "打开官方 Codex" : "打开中转站"}>
+            <ArrowUpRight size={16} />
+          </button>
+          {!isOfficial && (
+            <button className="card-open-button" onClick={() => onEdit(profile)} title="编辑配置">
+              <PencilSimple size={15} />
+            </button>
+          )}
+        </span>
       </div>
 
       <div className="subscription-card-tiles">
         <div className="subscription-mini-tile">
-          <Key size={17} />
-          <span>API Key</span>
-          <strong>{profile.apiKeyPreview}</strong>
+          {isOfficial ? <ShieldCheck size={17} /> : <Key size={17} />}
+          <span>{authLabel}</span>
+          <strong>{authValue}</strong>
         </div>
         <div className={`subscription-mini-tile tinted ${statusTone}`}>
           <ShieldCheck size={17} />
@@ -974,20 +1144,28 @@ function SubscriptionCard({
           <LinkSimple size={16} />
         </span>
         <span>
-          <strong title={profile.normalizedBaseUrl}>{profile.normalizedBaseUrl}</strong>
-          <small>Base URL</small>
+          <strong title={endpointValue}>{endpointValue}</strong>
+          <small>{endpointLabel}</small>
         </span>
         <button
-          onClick={() => void navigator.clipboard?.writeText(profile.normalizedBaseUrl)}
-          title="复制地址"
+          onClick={() => void navigator.clipboard?.writeText(endpointValue)}
+          title={isOfficial ? "复制登录命令" : "复制地址"}
         >
           <CopySimple size={15} />
         </button>
       </div>
 
+      <UsagePanel usage={profile.usage} isOfficial={isOfficial} />
+
       <div className="subscription-tag-row">
-        <ProfileTagList tagIds={profile.tagIds} tags={tags} />
-        {!profile.tagIds.length && <em>未设置标签</em>}
+        {isOfficial ? (
+          <em>内置官方配置，不参与评分标签</em>
+        ) : (
+          <>
+            <ProfileTagList tagIds={profile.tagIds} tags={tags} />
+            {!profile.tagIds.length && <em>未设置标签</em>}
+          </>
+        )}
       </div>
 
       <div className="subscription-card-footer">
@@ -998,23 +1176,96 @@ function SubscriptionCard({
             <small>{profile.isActive ? "Last applied" : "Last updated"}</small>
           </span>
         </span>
-        <span className="subscription-code">#{profile.id.slice(0, 6)}</span>
+        <span className="subscription-code">{isOfficial ? "OFFICIAL" : `#${profile.id.slice(0, 6)}`}</span>
       </div>
 
       <div className="subscription-card-actions">
-        <button onClick={() => void onTest(profile.id)} disabled={isWorking}>
-          <CloudCheck size={16} />
-          {isTesting ? "测试中" : "测试"}
-        </button>
+        {canConnectDashboard && (
+          <button
+            className={`balance-auth ${dashboardConnected ? "connected" : ""}`}
+            onClick={() => void onConnectDashboardAuth(profile)}
+            disabled={isWorking}
+            title={profile.dashboardAuth?.message}
+          >
+            <Plug size={16} />
+            {isConnectingDashboard ? "登录中" : dashboardConnected ? "重连余额" : "连接余额"}
+          </button>
+        )}
+        {!isOfficial && (
+          <button onClick={() => void onTest(profile.id)} disabled={isWorking}>
+            <CloudCheck size={16} />
+            {isTesting ? "测试中" : "测试"}
+          </button>
+        )}
         <button className="dark" onClick={() => void onApply(profile.id)} disabled={isWorking}>
           <Lightning size={16} weight="fill" />
-          切换
+          {isOfficial ? "官方登录" : "切换"}
         </button>
-        <button className="danger" onClick={() => void onDelete(profile)} disabled={isWorking}>
-          <Trash size={16} />
-        </button>
+        {!isOfficial && (
+          <button className="danger" onClick={() => void onDelete(profile)} disabled={isWorking}>
+            <Trash size={16} />
+          </button>
+        )}
       </div>
     </article>
+  );
+}
+
+function UsagePanel({
+  usage,
+  isOfficial
+}: {
+  usage: PublicProfile["usage"];
+  isOfficial: boolean;
+}): ReactElement {
+  if (!usage) {
+    return (
+      <div className="subscription-usage-panel unknown">
+        <div className="usage-panel-head">
+          <ChartBar size={16} />
+          <span>
+            <strong>{isOfficial ? "官方余量待同步" : "余额待同步"}</strong>
+            <small>后台会自动刷新</small>
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const hasWindows = isOfficial && usage.windows?.length;
+  return (
+    <div className={`subscription-usage-panel ${usage.status} ${isOfficial ? "official" : ""}`}>
+      <div className="usage-panel-head">
+        <ChartBar size={16} />
+        <span>
+          <strong title={usage.value}>{usage.value}</strong>
+          <small title={usage.message || ""}>
+            {usage.label}
+            {usage.updatedAt ? ` · ${formatDate(usage.updatedAt)}` : ""}
+            {usage.message ? ` · ${usage.message}` : ""}
+          </small>
+        </span>
+      </div>
+      {hasWindows && (
+        <div className="usage-window-list">
+          {usage.windows?.map((window) => {
+            const remaining = window.remainingPercent ?? (window.usedPercent !== undefined ? 100 - window.usedPercent : undefined);
+            return (
+              <div className="usage-window-row" key={window.id}>
+                <span>
+                  <strong>{window.label}</strong>
+                  <small>{window.resetAt ? `${formatDate(window.resetAt)} 重置` : "等待重置时间"}</small>
+                </span>
+                <div className="usage-window-meter" aria-label={`${window.label} 剩余 ${remaining !== undefined ? formatPercent(remaining) : "未知"}`}>
+                  <i style={{ width: `${remaining !== undefined ? Math.max(4, Math.min(100, remaining)) : 4}%` }} />
+                </div>
+                <em>{remaining !== undefined ? formatPercent(remaining) : "--"}</em>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1336,6 +1587,10 @@ function formatDate(value?: string): string {
     hour: "2-digit",
     minute: "2-digit"
   }).format(new Date(value));
+}
+
+function formatPercent(value: number): string {
+  return `${Math.max(0, Math.min(100, Math.round(value)))}%`;
 }
 
 function testLabel(profile: PublicProfile): string {
