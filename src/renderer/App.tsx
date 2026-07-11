@@ -1,12 +1,14 @@
 import {
   ArrowClockwise,
   ArrowUpRight,
+  Archive,
   BatteryCharging,
   CaretDown,
   ChartBar,
   Check,
   CheckCircle,
   ClipboardText,
+  ClockCounterClockwise,
   CloudCheck,
   CopySimple,
   CurrencyCircleDollar,
@@ -45,6 +47,7 @@ import type {
   DynamicEnduranceSettings,
   DynamicEnduranceStrategy,
   OperationResult,
+  BackupRecord,
   ProfileTag,
   ProviderDetection,
   PublicProfile,
@@ -64,9 +67,10 @@ type BusyAction =
   | "connecting-dashboard"
   | "saving-settings"
   | "dynamic-endurance"
+  | "restoring-backup"
   | null;
 
-type ActiveView = "profiles" | "settings";
+type ActiveView = "profiles" | "backups" | "settings";
 
 interface FormState {
   baseUrl: string;
@@ -558,7 +562,29 @@ function App(): ReactElement {
     await api.openExternal(target);
   }
 
+  async function handleRestoreBackup(backup: BackupRecord): Promise<void> {
+    const confirmed = window.confirm(
+      `恢复 ${formatBackupDate(backup.createdAt)} 的备份？\n\n当前 Codex 配置会先自动创建一份安全备份。`
+    );
+    if (!confirmed) {
+      return;
+    }
+    setBusy("restoring-backup");
+    try {
+      const result = await api.restoreBackup(backup.id);
+      applyResult(result, result.backupDir ? `恢复前安全备份: ${result.backupDir}` : undefined);
+      showToast({
+        tone: result.ok ? "ok" : "warn",
+        title: result.ok ? "备份已恢复" : "恢复失败",
+        detail: result.restart?.message || result.message
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const profiles = state?.profiles || [];
+  const backups = state?.backups || [];
   const customProfiles = profiles.filter((profile) => !profile.builtin);
   const tags = state?.tags || [];
   const current = state?.current;
@@ -639,6 +665,9 @@ function App(): ReactElement {
           <button className={activeView === "profiles" ? "active" : ""} onClick={() => setActiveView("profiles")} title="配置库">
             <Database size={19} weight={activeView === "profiles" ? "fill" : "regular"} />
           </button>
+          <button className={activeView === "backups" ? "active" : ""} onClick={() => setActiveView("backups")} title="备份恢复">
+            <ClockCounterClockwise size={19} weight={activeView === "backups" ? "fill" : "regular"} />
+          </button>
           <button className={activeView === "settings" ? "active" : ""} onClick={() => setActiveView("settings")} title="设置">
             <GearSix size={19} weight={activeView === "settings" ? "fill" : "regular"} />
           </button>
@@ -649,9 +678,6 @@ function App(): ReactElement {
           </button>
           <button onClick={() => api.revealPath("storage")} title="打开 profiles.json">
             <Database size={18} />
-          </button>
-          <button onClick={() => api.revealPath("backupRoot")} title="打开备份目录">
-            <ClipboardText size={18} />
           </button>
         </div>
       </aside>
@@ -763,10 +789,7 @@ function App(): ReactElement {
           <section className="view-panel settings-view">
             <section className="settings-panel">
               <div className="settings-header">
-                <div>
-                  <span>Settings</span>
-                  <h1>设置</h1>
-                </div>
+                <h1>设置</h1>
                 <button
                   className="sync-usage-button"
                   onClick={() => void refreshUsage(true)}
@@ -907,6 +930,56 @@ function App(): ReactElement {
                   )}
                 </section>
               </div>
+            </section>
+          </section>
+        )}
+
+        {activeView === "backups" && (
+          <section className="view-panel backups-view">
+            <section className="backups-panel">
+              <div className="backups-header">
+                <h1>备份恢复</h1>
+              </div>
+
+              {busy === "loading" ? (
+                <div className="backup-loading" aria-live="polite">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              ) : backups.length === 0 ? (
+                <div className="empty-state backup-empty">
+                  <Archive size={30} />
+                  <p>还没有备份记录，首次切换配置后会自动创建。</p>
+                </div>
+              ) : (
+                <div className="backup-list">
+                  {backups.map((backup) => (
+                    <article className="backup-row" key={backup.id}>
+                      <span className="backup-row-icon">
+                        <Archive size={20} />
+                      </span>
+                      <div className="backup-main">
+                        <strong>{backup.profileName}</strong>
+                        <small>{backup.baseUrl || "Codex 本地配置"}</small>
+                      </div>
+                      <div className="backup-files" aria-label="备份包含的文件">
+                        <span className={backup.hasAuth ? "available" : ""}>auth.json</span>
+                        <span className={backup.hasConfig ? "available" : ""}>config.toml</span>
+                      </div>
+                      <time dateTime={backup.createdAt}>{formatBackupDate(backup.createdAt)}</time>
+                      <button
+                        className="backup-restore-button"
+                        onClick={() => void handleRestoreBackup(backup)}
+                        disabled={isWorking || (!backup.hasAuth && !backup.hasConfig)}
+                      >
+                        <ClockCounterClockwise size={16} />
+                        {busy === "restoring-backup" ? "恢复中" : "恢复"}
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              )}
             </section>
           </section>
         )}
@@ -1683,6 +1756,17 @@ function formatDate(value?: string): string {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function formatBackupDate(value: string): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
   }).format(new Date(value));
 }
 

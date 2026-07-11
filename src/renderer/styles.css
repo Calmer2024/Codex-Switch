@@ -2721,11 +2721,11 @@ button:disabled {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 36px;
-  padding: 0 12px;
-  border: 1px solid #ededee;
-  border-radius: 10px;
-  background: #fbfbfc;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: #707783;
   cursor: pointer;
   font-size: 12px;
@@ -2733,9 +2733,15 @@ button:disabled {
 }
 
 .switch-toggle.on {
-  border-color: #cfead9;
-  background: #effaf3;
   color: #19854b;
+}
+
+.switch-toggle:hover {
+  color: #3f4651;
+}
+
+.switch-toggle.on:hover {
+  color: #146d3e;
 }
 
 .strategy-options {
@@ -2806,6 +2812,7 @@ button:disabled {
 .settings-action-row .secondary-action {
   min-height: 38px;
   border-radius: 10px;
+  font-size: 11px;
 }
 
 .settings-stat-grid {
@@ -2939,6 +2946,178 @@ button:disabled {
 
 .settings-empty {
   min-height: 150px;
+}
+
+.backups-view {
+  background: #ffffff;
+}
+
+.backups-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+  padding: 38px 44px 26px;
+}
+
+.backups-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 112px;
+}
+
+.backups-header > div {
+  display: grid;
+  gap: 6px;
+}
+
+.backups-header span {
+  color: #8b919b;
+  font-size: 12px;
+}
+
+.backups-header h1 {
+  color: #101116;
+  font-size: 32px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.backups-header p {
+  color: #818793;
+  font-size: 12px;
+}
+
+.backups-header .secondary-action {
+  min-height: 34px;
+  border-radius: 9px;
+  font-size: 11px;
+}
+
+.backup-list {
+  min-height: 0;
+  overflow-y: auto;
+  border-top: 1px solid #eceef2;
+  scrollbar-width: thin;
+  scrollbar-color: #d9dce2 transparent;
+}
+
+.backup-row {
+  display: grid;
+  grid-template-columns: 38px minmax(220px, 1fr) minmax(190px, auto) 170px 82px;
+  align-items: center;
+  gap: 14px;
+  min-height: 72px;
+  padding: 11px 4px;
+  border-bottom: 1px solid #eceef2;
+}
+
+.backup-row-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: #f2f4f7;
+  color: #59616d;
+}
+
+.backup-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.backup-main strong,
+.backup-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-main strong {
+  color: #20222d;
+  font-size: 13px;
+}
+
+.backup-main small {
+  color: #858b95;
+  font-size: 11px;
+}
+
+.backup-files {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.backup-files span {
+  padding: 4px 7px;
+  border: 1px solid #eceef2;
+  border-radius: 6px;
+  color: #adb1b8;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+}
+
+.backup-files span.available {
+  border-color: #d9e6dd;
+  background: #f5faf7;
+  color: #397451;
+}
+
+.backup-row time {
+  color: #707783;
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.backup-restore-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid #dfe3e8;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #272a31;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.backup-restore-button:hover {
+  border-color: #bfc5cd;
+  background: #f7f8fa;
+}
+
+.backup-empty {
+  min-height: 220px;
+}
+
+.backup-loading {
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  padding-top: 1px;
+}
+
+.backup-loading span {
+  height: 72px;
+  background: linear-gradient(90deg, #f7f8fa 25%, #eef1f4 50%, #f7f8fa 75%);
+  background-size: 200% 100%;
+  animation: backup-loading 1.2s ease-in-out infinite;
+}
+
+@keyframes backup-loading {
+  to {
+    background-position: -200% 0;
+  }
 }
 
 .modal-backdrop {
@@ -3191,6 +3370,10 @@ button:disabled {
   .subscription-card-actions button,
   .card-open-button {
     transition: none;
+  }
+
+  .backup-loading span {
+    animation: none;
   }
 }
 

@@ -153,7 +153,27 @@ let mockState: AppState = {
     lastMessage: "动态续航保持 OpenRouter（经济模式）"
   },
   storagePath: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\profiles.json",
-  backupRoot: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\backups"
+  backupRoot: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\backups",
+  backups: [
+    {
+      id: "2026-06-26T08-32-00-000Z",
+      createdAt: new Date(2026, 5, 26, 16, 32).toISOString(),
+      profileId: "mock-2",
+      profileName: "OpenRouter",
+      baseUrl: "https://openrouter.ai/v1",
+      hasAuth: true,
+      hasConfig: true
+    },
+    {
+      id: "2026-06-25T03-18-00-000Z",
+      createdAt: new Date(2026, 5, 25, 11, 18).toISOString(),
+      profileId: "mock-1",
+      profileName: "YunDu Relay",
+      baseUrl: "https://api.yundu.lat/v1",
+      hasAuth: true,
+      hasConfig: true
+    }
+  ]
 };
 
 function detect(input: string) {
@@ -374,6 +394,10 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
       ok: false,
       message: "开发预览不安装更新"
     }),
+    restoreBackup: async (backupId: string) => {
+      const backup = mockState.backups.find((item) => item.id === backupId);
+      return backup ? result(`已恢复 ${backup.profileName} 的备份`) : { ok: false, message: "备份记录不存在" };
+    },
     revealPath: async () => undefined,
     openExternal: async () => undefined
   };

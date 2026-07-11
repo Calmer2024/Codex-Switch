@@ -102,6 +102,16 @@ export interface CurrentCodexConfig {
   matchedProfileId?: string;
 }
 
+export interface BackupRecord {
+  id: string;
+  createdAt: string;
+  profileId?: string;
+  profileName: string;
+  baseUrl?: string;
+  hasAuth: boolean;
+  hasConfig: boolean;
+}
+
 export interface AppState {
   profiles: PublicProfile[];
   tags: ProfileTag[];
@@ -109,6 +119,7 @@ export interface AppState {
   dynamicEndurance: DynamicEnduranceSettings;
   storagePath: string;
   backupRoot: string;
+  backups: BackupRecord[];
 }
 
 export interface SaveProfileInput {
@@ -174,6 +185,7 @@ export interface CodexSwitchApi {
   runDynamicEndurance: () => Promise<OperationResult>;
   checkLocalUpdate: () => Promise<LocalUpdateInfo>;
   installLocalUpdate: () => Promise<OperationResult>;
+  restoreBackup: (backupId: string) => Promise<OperationResult>;
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => Promise<void>;
   openExternal: (url: string) => Promise<void>;
 }

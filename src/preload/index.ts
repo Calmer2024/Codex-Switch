@@ -23,6 +23,7 @@ const api: CodexSwitchApi = {
   runDynamicEndurance: () => ipcRenderer.invoke("codex-switch:run-dynamic-endurance"),
   checkLocalUpdate: () => ipcRenderer.invoke("codex-switch:check-local-update"),
   installLocalUpdate: () => ipcRenderer.invoke("codex-switch:install-local-update"),
+  restoreBackup: (backupId: string) => ipcRenderer.invoke("codex-switch:restore-backup", backupId),
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => ipcRenderer.invoke("codex-switch:reveal-path", kind),
   openExternal: (url: string) => ipcRenderer.invoke("codex-switch:open-external", url)
 };

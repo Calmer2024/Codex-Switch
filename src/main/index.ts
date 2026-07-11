@@ -3,10 +3,12 @@ import type { WebContents } from "electron";
 import { spawn } from "node:child_process";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promises as fs } from "node:fs";
+import { watch } from "node:fs";
 import os from "node:os";
 import crypto from "node:crypto";
 import type {
   AppState,
+  BackupRecord,
   CodexRestartResult,
   DynamicEnduranceSettings,
   DynamicEnduranceStrategy,
@@ -85,6 +87,16 @@ interface LocalUpdatePreference {
   pendingVersion?: string;
   lastCheckedAt?: string;
   lastInstallStartedAt?: string;
+  failedSha512?: string;
+  failedAt?: string;
+}
+
+interface LocalUpdateResult {
+  status: "success" | "failed";
+  version?: string;
+  sha512?: string;
+  exitCode?: number;
+  message?: string;
 }
 
 interface DevUpdateConfig {
@@ -160,6 +172,9 @@ const BALANCE_RETRY_COUNT = 2;
 const BALANCE_RETRY_DELAY_MS = 420;
 const LOCAL_UPDATE_INITIAL_CHECK_MS = 8000;
 const LOCAL_UPDATE_CHECK_INTERVAL_MS = 60000;
+const LOCAL_UPDATE_RESULT_FILE = "update-result.json";
+const DYNAMIC_ACTIVITY_DEBOUNCE_MS = 6500;
+const CODEX_RESTART_DEBOUNCE_MS = 450;
 const USAGE_SYNC_INTERVAL_FRIENDLY_NAME = "额度同步";
 const OFFICIAL_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const YUNDU_PROFILE_PATH = "/api/v1/user/profile";
@@ -170,6 +185,14 @@ const activeTestTimeouts = new Set<ReturnType<typeof setTimeout>>();
 let forceExitTimer: ReturnType<typeof setTimeout> | undefined;
 let localUpdateTimer: ReturnType<typeof setInterval> | undefined;
 let localUpdateInstallInProgress = false;
+let mainWindow: BrowserWindow | null = null;
+let dynamicActivityTimer: ReturnType<typeof setTimeout> | undefined;
+let dynamicSessionWatcher: import("node:fs").FSWatcher | undefined;
+let dynamicProbeInProgress = false;
+let restartTimer: ReturnType<typeof setTimeout> | undefined;
+let restartBeforeSignature = "";
+let restartAfterSignature = "";
+let restartWaiters: Array<(result: CodexRestartResult) => void> = [];
 
 function abortActiveTestRequests(): void {
   for (const timeout of activeTestTimeouts) {
@@ -247,7 +270,7 @@ const knownProviders: Array<{
 ];
 
 function createWindow(): void {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1280,
     height: 780,
     minWidth: 1280,
@@ -267,6 +290,10 @@ function createWindow(): void {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
     return { action: "deny" };
+  });
+
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -860,6 +887,93 @@ async function createBackup(profile: BackupSubject): Promise<string> {
   return backupDir;
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listBackups(): Promise<BackupRecord[]> {
+  const { backupRoot } = paths();
+  const entries = await fs.readdir(backupRoot, { withFileTypes: true }).catch(() => []);
+  const records = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry): Promise<BackupRecord | undefined> => {
+        const backupDir = join(backupRoot, entry.name);
+        try {
+          const rawMeta = await readTextIfExists(join(backupDir, "meta.json"));
+          const meta = rawMeta.trim()
+            ? (JSON.parse(rawMeta) as Partial<BackupSubject> & { createdAt?: string })
+            : {};
+          const stat = await fs.stat(backupDir);
+          return {
+            id: entry.name,
+            createdAt: meta.createdAt || stat.mtime.toISOString(),
+            profileId: meta.id,
+            profileName: meta.name || "未知配置",
+            baseUrl: meta.baseUrl,
+            hasAuth: await fileExists(join(backupDir, "auth.json")),
+            hasConfig: await fileExists(join(backupDir, "config.toml"))
+          };
+        } catch {
+          return undefined;
+        }
+      })
+  );
+  return records
+    .filter((record): record is BackupRecord => Boolean(record))
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+}
+
+async function restoreBackup(backupId: string): Promise<OperationResult> {
+  try {
+    const backups = await listBackups();
+    const backup = backups.find((record) => record.id === backupId);
+    if (!backup) {
+      throw new Error("备份记录不存在或已经被删除");
+    }
+    if (!backup.hasAuth && !backup.hasConfig) {
+      throw new Error("这个备份不包含可恢复的 Codex 配置文件");
+    }
+
+    const { backupRoot, authPath, configPath } = paths();
+    const backupDir = join(backupRoot, backup.id);
+    const [authBefore, configBefore] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
+    const beforeSignature = configSignature(authBefore, configBefore);
+    const safetyBackupDir = await createBackup({
+      id: "restore-safety",
+      name: "恢复前安全备份",
+      baseUrl: backup.profileName
+    });
+
+    const restoreFile = async (fileName: string, targetPath: string): Promise<void> => {
+      const sourcePath = join(backupDir, fileName);
+      if (await fileExists(sourcePath)) {
+        await writeTextAtomic(targetPath, await fs.readFile(sourcePath, "utf8"));
+      } else {
+        await fs.rm(targetPath, { force: true });
+      }
+    };
+
+    await Promise.all([restoreFile("auth.json", authPath), restoreFile("config.toml", configPath)]);
+    const [authAfter, configAfter] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
+    const restart = await restartCodexForConfigChange(beforeSignature, configSignature(authAfter, configAfter));
+    return {
+      ok: true,
+      message: `已恢复 ${backup.profileName} 的备份`,
+      backupDir: safetyBackupDir,
+      restart,
+      state: await getState()
+    };
+  } catch (error) {
+    return { ok: false, message: normalizeError(error), state: await getState().catch(() => undefined) };
+  }
+}
+
 async function copyIfExists(source: string, target: string): Promise<void> {
   try {
     await fs.copyFile(source, target);
@@ -925,7 +1039,8 @@ async function getState(): Promise<AppState> {
     },
     dynamicEndurance: normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance),
     storagePath: location.storagePath,
-    backupRoot: location.backupRoot
+    backupRoot: location.backupRoot,
+    backups: await listBackups()
   };
 }
 
@@ -2357,6 +2472,10 @@ function dynamicProfileScore(profile: StoredProfile, tags: ProfileTag[], strateg
   return price * 100000 + stability * 10000 + speed * 1000 + dilution * 100 + balance + freshness / 1000;
 }
 
+function readConfiguredModel(configContent: string): string {
+  return /^\s*model\s*=\s*["']([^"']+)["']/m.exec(configContent)?.[1] || "gpt-5.1-codex";
+}
+
 async function testStoredProfileConnection(profile: StoredProfile): Promise<{ ok: boolean; message: string }> {
   let endpoint = "";
   let controller: AbortController | undefined;
@@ -2367,36 +2486,44 @@ async function testStoredProfileConnection(profile: StoredProfile): Promise<{ ok
       throw new Error("这个配置没有可用 API Key");
     }
     const normalized = normalizeBaseUrl(profile.baseUrl);
-    endpoint = normalized.replace(/\/$/, "").endsWith("/v1") ? `${normalized}/models` : `${normalized}/v1/models`;
+    endpoint = normalized.replace(/\/$/, "").endsWith("/v1") ? `${normalized}/responses` : `${normalized}/v1/responses`;
+    const model = readConfiguredModel(await readTextIfExists(paths().configPath));
     controller = new AbortController();
     activeTestControllers.add(controller);
     const startedAt = Date.now();
     timeout = setTimeout(() => controller?.abort(), 9000);
     activeTestTimeouts.add(timeout);
     const response = await fetch(endpoint, {
-      method: "GET",
+      method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
+      body: JSON.stringify({
+        model,
+        input: "Reply with OK only.",
+        max_output_tokens: 16,
+        stream: false,
+        store: false
+      }),
       signal: controller.signal
     });
     const duration = Date.now() - startedAt;
     if (!response.ok) {
       const body = compactResponseText(await response.text().catch(() => ""));
       const suffix = body ? `，响应：${body}` : "";
-      throw new Error(`GET ${compactEndpoint(endpoint)} 返回 ${response.status} ${response.statusText || ""}${suffix}`.trim());
+      throw new Error(`POST ${compactEndpoint(endpoint)} 返回 ${response.status} ${response.statusText || ""}${suffix}`.trim());
     }
     return {
       ok: true,
-      message: `GET ${compactEndpoint(endpoint)} 返回 ${response.status}，耗时 ${duration}ms`
+      message: `真实生成链路返回 ${response.status}，耗时 ${duration}ms`
     };
   } catch (error) {
     return {
       ok: false,
       message:
         error instanceof Error && error.name === "AbortError"
-          ? `GET ${compactEndpoint(endpoint || profile.baseUrl)} 超时（9 秒）`
+          ? `POST ${compactEndpoint(endpoint || profile.baseUrl)} 超时（9 秒）`
           : normalizeError(error)
     };
   } finally {
@@ -2423,7 +2550,7 @@ function applyDynamicEnduranceRun(
   return next;
 }
 
-async function runDynamicEndurance(refreshBalances = true): Promise<OperationResult> {
+async function runDynamicEndurance(refreshBalances = true, excludedProfileId?: string): Promise<OperationResult> {
   let selectedId: string | undefined;
   try {
     const store = await readStore();
@@ -2453,7 +2580,7 @@ async function runDynamicEndurance(refreshBalances = true): Promise<OperationRes
     }
 
     const rankedProfiles = store.profiles
-      .filter((profile) => usageHasBalance(profile.usage))
+      .filter((profile) => profile.id !== excludedProfileId && usageHasBalance(profile.usage))
       .sort((left, right) => dynamicProfileScore(right, store.tags, settings.strategy) - dynamicProfileScore(left, store.tags, settings.strategy));
 
     if (!rankedProfiles.length) {
@@ -2590,6 +2717,70 @@ async function runDynamicEnduranceIfEnabled(refreshBalances = true): Promise<voi
     await runDynamicEndurance(refreshBalances);
   } catch {
     // Startup checks should never block the main window.
+  }
+}
+
+async function probeActiveProfileAfterCodexActivity(): Promise<void> {
+  if (dynamicProbeInProgress) {
+    return;
+  }
+  dynamicProbeInProgress = true;
+  try {
+    const store = await readStore();
+    if (!normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance).enabled) {
+      return;
+    }
+    const current = await readCurrentConfig();
+    const activeProfile = store.profiles.find(
+      (profile) =>
+        normalizeComparableUrl(profile.baseUrl) === normalizeComparableUrl(current.baseUrl) &&
+        profile.apiKeyHash === current.apiKeyHash
+    );
+    if (!activeProfile) {
+      return;
+    }
+    const test = await testStoredProfileConnection(activeProfile);
+    activeProfile.testStatus = test.ok ? "ok" : "failed";
+    activeProfile.lastTestedAt = nowIso();
+    activeProfile.lastTestMessage = test.message;
+    await writeStore(store);
+    if (!test.ok) {
+      await runDynamicEndurance(true, activeProfile.id);
+    }
+  } catch {
+    // Activity monitoring must not interfere with Codex itself.
+  } finally {
+    dynamicProbeInProgress = false;
+  }
+}
+
+function scheduleDynamicActivityProbe(): void {
+  if (dynamicActivityTimer) {
+    clearTimeout(dynamicActivityTimer);
+  }
+  dynamicActivityTimer = setTimeout(() => {
+    dynamicActivityTimer = undefined;
+    void probeActiveProfileAfterCodexActivity();
+  }, DYNAMIC_ACTIVITY_DEBOUNCE_MS);
+}
+
+function startDynamicSessionWatcher(): void {
+  if (dynamicSessionWatcher) {
+    return;
+  }
+  const sessionsRoot = join(os.homedir(), ".codex", "sessions");
+  try {
+    dynamicSessionWatcher = watch(sessionsRoot, { recursive: true }, (_event, fileName) => {
+      if (fileName?.toString().toLowerCase().endsWith(".jsonl")) {
+        scheduleDynamicActivityProbe();
+      }
+    });
+    dynamicSessionWatcher.on("error", () => {
+      dynamicSessionWatcher?.close();
+      dynamicSessionWatcher = undefined;
+    });
+  } catch {
+    // The sessions directory may not exist until Codex has been used once.
   }
 }
 
@@ -2776,7 +2967,7 @@ function runProcess(command: string, args: string[], timeoutMs: number): Promise
   });
 }
 
-async function restartCodexForConfigChange(beforeSignature: string, afterSignature: string): Promise<CodexRestartResult> {
+async function performCodexRestart(beforeSignature: string, afterSignature: string): Promise<CodexRestartResult> {
   if (beforeSignature === afterSignature) {
     return {
       needed: false,
@@ -2801,28 +2992,45 @@ async function restartCodexForConfigChange(beforeSignature: string, afterSignatu
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-$main = @(Get-CimInstance Win32_Process | Where-Object {
-  $_.Name -ieq 'Codex.exe' -and
-  $_.CommandLine -notmatch '--type=' -and
-  $_.ExecutablePath -match '\\\\OpenAI\\.Codex_.*\\\\app\\\\Codex\\.exe$'
+$desktopProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.ExecutablePath -match '\\\\OpenAI\\.Codex_.*\\\\app\\\\' -and
+  $_.Name -in @('Codex.exe', 'ChatGPT.exe', 'codex.exe', 'codex-code-mode-host.exe')
 })
-$appServers = @(Get-CimInstance Win32_Process | Where-Object {
-  $_.Name -ieq 'codex.exe' -and
-  $_.CommandLine -match '\\bapp-server\\b' -and
-  $_.ExecutablePath -match '\\\\OpenAI\\.Codex_.*\\\\app\\\\resources\\\\codex\\.exe$'
+$main = @($desktopProcesses | Where-Object {
+  $_.Name -in @('Codex.exe', 'ChatGPT.exe') -and
+  $_.CommandLine -notmatch '--type=' -and
+  $_.ExecutablePath -match '\\\\app\\\\(Codex|ChatGPT)\\.exe$'
+})
+$backend = @($desktopProcesses | Where-Object {
+  $_.Name -in @('codex.exe', 'codex-code-mode-host.exe')
 })
 if ($main.Count -eq 0) {
-  @{ processCount = 0; restarted = $false; message = '未检测到运行中的 Codex 桌面端，下次启动生效' } | ConvertTo-Json -Compress
+  @{ processCount = 0; restarted = $false; message = '未检测到运行中的 ChatGPT 桌面端，下次启动生效' } | ConvertTo-Json -Compress
+  exit 0
+}
+$backendIds = @($backend | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
+if ($backendIds.Count -gt 0) {
+  foreach ($id in $backendIds) {
+    Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+  }
+  $backendDeadline = (Get-Date).AddSeconds(5)
+  while ((@($backendIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0) -and (Get-Date) -lt $backendDeadline) {
+    Start-Sleep -Milliseconds 100
+  }
+  @{ processCount = $backendIds.Count; restarted = $true; message = '已无感刷新 Codex 后台服务' } | ConvertTo-Json -Compress
   exit 0
 }
 $exe = $main[0].ExecutablePath
-$ids = @($main + $appServers | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
+$ids = @($desktopProcesses | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
 foreach ($id in $ids) {
   Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
 }
-Start-Sleep -Milliseconds 900
+$deadline = (Get-Date).AddSeconds(5)
+while ((@($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0) -and (Get-Date) -lt $deadline) {
+  Start-Sleep -Milliseconds 100
+}
 Start-Process -FilePath $exe
-@{ processCount = $ids.Count; restarted = $true; message = '已自动重启 Codex 桌面端' } | ConvertTo-Json -Compress
+@{ processCount = $ids.Count; restarted = $true; message = '已自动重启 ChatGPT 桌面端' } | ConvertTo-Json -Compress
 `;
 
   const result = await runProcess("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], 12000);
@@ -2854,6 +3062,34 @@ Start-Process -FilePath $exe
       message: "自动重启 Codex 的结果无法解析"
     };
   }
+}
+
+function restartCodexForConfigChange(beforeSignature: string, afterSignature: string): Promise<CodexRestartResult> {
+  if (!restartBeforeSignature) {
+    restartBeforeSignature = beforeSignature;
+  }
+  restartAfterSignature = afterSignature;
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+  }
+
+  return new Promise((resolveRestart) => {
+    restartWaiters.push(resolveRestart);
+    restartTimer = setTimeout(() => {
+      restartTimer = undefined;
+      const firstSignature = restartBeforeSignature;
+      const finalSignature = restartAfterSignature;
+      const waiters = restartWaiters;
+      restartBeforeSignature = "";
+      restartAfterSignature = "";
+      restartWaiters = [];
+      void performCodexRestart(firstSignature, finalSignature).then((result) => {
+        for (const resolveWaiter of waiters) {
+          resolveWaiter(result);
+        }
+      });
+    }, CODEX_RESTART_DEBOUNCE_MS);
+  });
 }
 
 async function testProfile(input: TestProfileInput): Promise<OperationResult> {
@@ -3121,7 +3357,8 @@ async function checkLocalUpdate(): Promise<LocalUpdateInfo> {
     (preference.installedSha512
       ? preference.installedSha512 !== release.sha512
       : Number.isFinite(releaseTime) && releaseTime > exeMtime + 60000);
-  const available = versionDelta > 0 || sameVersionChanged;
+  const failedCurrentRelease = Boolean(release.sha512 && preference.failedSha512 === release.sha512);
+  const available = !failedCurrentRelease && (versionDelta > 0 || sameVersionChanged);
 
   const nextPreference: LocalUpdatePreference = {
     ...preference,
@@ -3140,7 +3377,11 @@ async function checkLocalUpdate(): Promise<LocalUpdateInfo> {
     version: release.version,
     releaseDate: release.releaseDate,
     installerPath: release.installerPath,
-    message: available ? "发现本地 release 更新，准备自动安装" : "当前已是本地 release 最新安装包"
+    message: available
+      ? "发现本地 release 更新，准备自动安装"
+      : failedCurrentRelease
+        ? "这个更新安装失败，等待新的发布版本"
+        : "当前已是本地 release 最新安装包"
   };
 }
 
@@ -3148,18 +3389,55 @@ function quotePowerShellString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function launchLocalUpdateInstaller(installerPath: string): void {
+async function launchLocalUpdateInstaller(installerPath: string, version?: string, sha512?: string): Promise<void> {
+  const resultPath = join(app.getPath("userData"), LOCAL_UPDATE_RESULT_FILE);
+  const runnerPath = join(app.getPath("userData"), "update-runner.ps1");
+  const logPath = join(app.getPath("userData"), "update.log");
+  const appPath = process.execPath;
   const script = [
     "$ErrorActionPreference = 'Stop'",
-    "Start-Sleep -Milliseconds 900",
-    `Start-Process -FilePath ${quotePowerShellString(installerPath)} -ArgumentList '/S'`
+    `$parentId = ${process.pid}`,
+    `$installerPath = ${quotePowerShellString(installerPath)}`,
+    `$appPath = ${quotePowerShellString(appPath)}`,
+    `$resultPath = ${quotePowerShellString(resultPath)}`,
+    `$logPath = ${quotePowerShellString(logPath)}`,
+    `$version = ${quotePowerShellString(version || "")}`,
+    `$sha512 = ${quotePowerShellString(sha512 || "")}`,
+    "$result = @{ status = 'failed'; version = $version; sha512 = $sha512; exitCode = -1; message = 'Installer did not finish' }",
+    "Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] Runner started; waiting for process $parentId\" -Encoding UTF8",
+    "try {",
+    "  $deadline = (Get-Date).AddSeconds(30)",
+    "  while ((Get-Process -Id $parentId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }",
+    "  Start-Sleep -Milliseconds 500",
+    "  Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] Starting installer $installerPath\" -Encoding UTF8",
+    "  $setup = Start-Process -FilePath $installerPath -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden",
+    "  $result.exitCode = $setup.ExitCode",
+    "  if ($setup.ExitCode -eq 0) {",
+    "    $result.status = 'success'",
+    "    $result.message = 'Update installed successfully'",
+    "  } else {",
+    "    $result.message = \"Installer exit code $($setup.ExitCode)\"",
+    "  }",
+    "} catch {",
+    "  $result.message = $_.Exception.Message",
+    "} finally {",
+    "  $resultJson = $result | ConvertTo-Json -Compress",
+    "  $resultJson | Out-File -LiteralPath $resultPath -Encoding UTF8 -Force",
+    "  Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] $($result.status): $($result.message); exit code $($result.exitCode)\" -Encoding UTF8",
+    "  if (Test-Path -LiteralPath $appPath) { Start-Process -FilePath $appPath }",
+    "}"
   ].join("\n");
-  const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
+  await fs.writeFile(runnerPath, `${script}\n`, "utf8");
+  const runnerArgs = `-NoProfile -ExecutionPolicy Bypass -File "${runnerPath.replace(/"/g, '`"')}"`;
+  const bootstrap = `Start-Process -FilePath 'powershell.exe' -ArgumentList ${quotePowerShellString(runnerArgs)} -WindowStyle Hidden`;
+  const launch = await runProcess(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", bootstrap],
+    5000
+  );
+  if (launch.code !== 0) {
+    throw new Error(launch.stderr.trim() || "无法启动更新协调器");
+  }
 }
 
 async function installLocalUpdate(): Promise<OperationResult> {
@@ -3193,8 +3471,8 @@ async function installLocalUpdate(): Promise<OperationResult> {
   };
   await writeStore(store);
 
-  launchLocalUpdateInstaller(update.installerPath);
-  setTimeout(() => quitApp(), 250);
+  await launchLocalUpdateInstaller(update.installerPath, update.version, release?.sha512);
+  setTimeout(() => quitApp(), 100);
 
   return {
     ok: true,
@@ -3207,9 +3485,32 @@ async function markPendingLocalUpdateInstalled(): Promise<void> {
   if (!app.isPackaged) {
     return;
   }
+  const resultPath = join(app.getPath("userData"), LOCAL_UPDATE_RESULT_FILE);
+  const rawResult = await readTextIfExists(resultPath);
+  if (!rawResult.trim()) {
+    return;
+  }
+  const result = JSON.parse(rawResult.replace(/^\uFEFF/, "")) as LocalUpdateResult;
+  await fs.rm(resultPath, { force: true });
   const store = await readStore();
   const preference = store.preferences.localUpdate;
   if (!preference?.pendingSha512 && !preference?.pendingVersion) {
+    return;
+  }
+
+  const resultMatchesPending =
+    (!preference.pendingVersion || result.version === preference.pendingVersion) &&
+    (!preference.pendingSha512 || result.sha512 === preference.pendingSha512);
+
+  if (result.status !== "success" || !resultMatchesPending) {
+    store.preferences.localUpdate = {
+      ...preference,
+      failedSha512: result.sha512 || preference.pendingSha512,
+      failedAt: nowIso()
+    };
+    delete store.preferences.localUpdate.pendingSha512;
+    delete store.preferences.localUpdate.pendingVersion;
+    await writeStore(store);
     return;
   }
 
@@ -3220,6 +3521,8 @@ async function markPendingLocalUpdateInstalled(): Promise<void> {
   };
   delete nextPreference.pendingSha512;
   delete nextPreference.pendingVersion;
+  delete nextPreference.failedSha512;
+  delete nextPreference.failedAt;
   store.preferences.localUpdate = nextPreference;
   await writeStore(store);
 }
@@ -3265,6 +3568,7 @@ function registerIpc(): void {
   ipcMain.handle("codex-switch:run-dynamic-endurance", () => runDynamicEndurance());
   ipcMain.handle("codex-switch:check-local-update", () => checkLocalUpdate());
   ipcMain.handle("codex-switch:install-local-update", () => installLocalUpdate());
+  ipcMain.handle("codex-switch:restore-backup", (_event, backupId: string) => restoreBackup(backupId));
   ipcMain.handle("codex-switch:reveal-path", async (_event, kind: "codexHome" | "storage" | "backupRoot") => {
     const location = paths();
     if (kind === "codexHome") {
@@ -3289,28 +3593,55 @@ if (process.platform === "win32") {
   app.setAppUserModelId(APP_USER_MODEL_ID);
 }
 
-app.whenReady().then(() => {
-  registerIpc();
-  createWindow();
-  void markPendingLocalUpdateInstalled()
-    .catch(() => undefined)
-    .finally(() => scheduleLocalUpdateChecks());
-  setTimeout(() => {
-    void runDynamicEnduranceIfEnabled(true);
-  }, 1800);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) {
+      if (app.isReady()) {
+        createWindow();
+      }
+      return;
     }
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.show();
+    mainWindow.focus();
   });
-});
+
+  app.whenReady().then(() => {
+    registerIpc();
+    createWindow();
+    startDynamicSessionWatcher();
+    void markPendingLocalUpdateInstalled()
+      .catch(() => undefined)
+      .finally(() => scheduleLocalUpdateChecks());
+    setTimeout(() => {
+      void runDynamicEnduranceIfEnabled(true);
+    }, 1800);
+
+    app.on("activate", () => {
+      if (!mainWindow) {
+        createWindow();
+      }
+    });
+  });
+}
 
 app.on("before-quit", () => {
   if (localUpdateTimer) {
     clearInterval(localUpdateTimer);
     localUpdateTimer = undefined;
   }
+  if (dynamicActivityTimer) {
+    clearTimeout(dynamicActivityTimer);
+    dynamicActivityTimer = undefined;
+  }
+  dynamicSessionWatcher?.close();
+  dynamicSessionWatcher = undefined;
   abortActiveTestRequests();
 });
 
