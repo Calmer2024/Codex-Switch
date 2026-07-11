@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { CodexSwitchApi, SaveProfileInput, TestProfileInput, UpdateProfileTagsInput } from "../shared/types";
+import type {
+  CodexSwitchApi,
+  SaveProfileInput,
+  TestProfileInput,
+  UpdateDynamicEnduranceInput,
+  UpdateProfileTagsInput
+} from "../shared/types";
 
 const api: CodexSwitchApi = {
   getState: () => ipcRenderer.invoke("codex-switch:get-state"),
@@ -12,6 +18,9 @@ const api: CodexSwitchApi = {
   testProfile: (input: TestProfileInput) => ipcRenderer.invoke("codex-switch:test-profile", input),
   refreshUsage: () => ipcRenderer.invoke("codex-switch:refresh-usage"),
   connectDashboardAuth: (profileId: string) => ipcRenderer.invoke("codex-switch:connect-dashboard-auth", profileId),
+  updateDynamicEndurance: (input: UpdateDynamicEnduranceInput) =>
+    ipcRenderer.invoke("codex-switch:update-dynamic-endurance", input),
+  runDynamicEndurance: () => ipcRenderer.invoke("codex-switch:run-dynamic-endurance"),
   checkLocalUpdate: () => ipcRenderer.invoke("codex-switch:check-local-update"),
   installLocalUpdate: () => ipcRenderer.invoke("codex-switch:install-local-update"),
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => ipcRenderer.invoke("codex-switch:reveal-path", kind),

@@ -3,6 +3,15 @@ export type TagMetric = "stability" | "price" | "dilution" | "speed";
 export type TagLevel = "high" | "medium" | "low";
 export type ProfileKind = "official" | "custom";
 export type UsageStatus = "unknown" | "ok" | "unsupported" | "failed";
+export type DynamicEnduranceStrategy = "economy" | "quality";
+
+export interface DynamicEnduranceSettings {
+  enabled: boolean;
+  strategy: DynamicEnduranceStrategy;
+  lastRunAt?: string;
+  lastProfileId?: string;
+  lastMessage?: string;
+}
 
 export interface UsageWindowInfo {
   id: "five-hour" | "weekly" | string;
@@ -97,6 +106,7 @@ export interface AppState {
   profiles: PublicProfile[];
   tags: ProfileTag[];
   current: CurrentCodexConfig;
+  dynamicEndurance: DynamicEnduranceSettings;
   storagePath: string;
   backupRoot: string;
 }
@@ -123,6 +133,11 @@ export interface TestProfileInput {
   apiKey?: string;
 }
 
+export interface UpdateDynamicEnduranceInput {
+  enabled: boolean;
+  strategy: DynamicEnduranceStrategy;
+}
+
 export interface OperationResult {
   ok: boolean;
   message: string;
@@ -132,6 +147,7 @@ export interface OperationResult {
   loginStarted?: boolean;
   restart?: CodexRestartResult;
   localUpdate?: LocalUpdateInfo;
+  dynamicEndurance?: DynamicEnduranceSettings;
 }
 
 export interface LocalUpdateInfo {
@@ -154,6 +170,8 @@ export interface CodexSwitchApi {
   testProfile: (input: TestProfileInput) => Promise<OperationResult>;
   refreshUsage: () => Promise<OperationResult>;
   connectDashboardAuth: (profileId: string) => Promise<OperationResult>;
+  updateDynamicEndurance: (input: UpdateDynamicEnduranceInput) => Promise<OperationResult>;
+  runDynamicEndurance: () => Promise<OperationResult>;
   checkLocalUpdate: () => Promise<LocalUpdateInfo>;
   installLocalUpdate: () => Promise<OperationResult>;
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => Promise<void>;

@@ -1,6 +1,6 @@
 {
   "name": "codex-switch",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A Windows desktop tool for switching Codex relay configurations.",
   "author": "Codex Switch",
   "private": true,

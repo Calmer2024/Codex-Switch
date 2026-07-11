@@ -1,11 +1,13 @@
 import type {
   AppState,
   CodexSwitchApi,
+  DynamicEnduranceStrategy,
   OperationResult,
   ProfileTag,
   PublicProfile,
   SaveProfileInput,
   TestProfileInput,
+  UpdateDynamicEnduranceInput,
   UpdateProfileTagsInput
 } from "../shared/types";
 
@@ -143,6 +145,13 @@ let mockState: AppState = {
     apiKeyPreview: "sk-02...demo",
     matchedProfileId: "mock-2"
   },
+  dynamicEndurance: {
+    enabled: true,
+    strategy: "economy",
+    lastRunAt: new Date(2026, 5, 26, 16, 35).toISOString(),
+    lastProfileId: "mock-2",
+    lastMessage: "动态续航保持 OpenRouter（经济模式）"
+  },
   storagePath: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\profiles.json",
   backupRoot: "C:\\Users\\demo\\AppData\\Roaming\\Codex Switch\\backups"
 };
@@ -171,6 +180,10 @@ function result(message: string, profile?: PublicProfile): OperationResult {
     state: mockState,
     profile
   };
+}
+
+function dynamicStrategyLabel(strategy: DynamicEnduranceStrategy): string {
+  return strategy === "quality" ? "质量模式" : "经济模式";
 }
 
 export function createMockCodexSwitchApi(): CodexSwitchApi {
@@ -267,6 +280,60 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
         }))
       };
       return result("额度已同步");
+    },
+    updateDynamicEndurance: async (input: UpdateDynamicEnduranceInput) => {
+      mockState = {
+        ...mockState,
+        dynamicEndurance: {
+          ...mockState.dynamicEndurance,
+          enabled: input.enabled,
+          strategy: input.strategy
+        }
+      };
+      return result(input.enabled ? `动态续航已启用：${dynamicStrategyLabel(input.strategy)}` : "动态续航已关闭");
+    },
+    runDynamicEndurance: async () => {
+      const candidates = mockState.profiles.filter((profile) => !profile.builtin && profile.usage?.status === "ok");
+      const selected = candidates.find((profile) => profile.tagIds.includes("price-low")) || candidates[0];
+      if (!selected) {
+        return {
+          ok: false,
+          message: "没有找到有余额的可用中转站",
+          state: mockState
+        };
+      }
+      mockState = {
+        ...mockState,
+        profiles: mockState.profiles.map((profile) => ({
+          ...profile,
+          isActive: profile.id === selected.id,
+          lastAppliedAt: profile.id === selected.id ? new Date().toISOString() : profile.lastAppliedAt
+        })),
+        current: {
+          ...mockState.current,
+          baseUrl: selected.baseUrl,
+          hasApiKey: true,
+          apiKeyPreview: selected.apiKeyPreview,
+          matchedProfileId: selected.id
+        },
+        dynamicEndurance: {
+          ...mockState.dynamicEndurance,
+          lastRunAt: new Date().toISOString(),
+          lastProfileId: selected.id,
+          lastMessage: `动态续航已切换到 ${selected.name}（${dynamicStrategyLabel(mockState.dynamicEndurance.strategy)}）`
+        }
+      };
+      return {
+        ...result(mockState.dynamicEndurance.lastMessage || "动态续航已完成", selected),
+        dynamicEndurance: mockState.dynamicEndurance,
+        restart: {
+          needed: true,
+          attempted: false,
+          restarted: false,
+          processCount: 0,
+          message: "开发预览不会重启 Codex"
+        }
+      };
     },
     connectDashboardAuth: async (profileId: string) => {
       mockState = {

@@ -8,6 +8,8 @@ import crypto from "node:crypto";
 import type {
   AppState,
   CodexRestartResult,
+  DynamicEnduranceSettings,
+  DynamicEnduranceStrategy,
   LocalUpdateInfo,
   OperationResult,
   ProviderDetection,
@@ -15,7 +17,8 @@ import type {
   ProfileTag,
   PublicProfile,
   SaveProfileInput,
-  TestProfileInput
+  TestProfileInput,
+  UpdateDynamicEnduranceInput
 } from "../shared/types";
 
 type SecretStorage = "safeStorage" | "base64";
@@ -70,6 +73,7 @@ interface StoreFile {
     authKeyName: string;
     providerName: string;
     officialUsage?: ProfileUsageSummary;
+    dynamicEndurance?: DynamicEnduranceSettings;
     localUpdate?: LocalUpdatePreference;
   };
 }
@@ -144,6 +148,10 @@ const CHATGPT_AUTH_MODE = "chatgpt";
 const DEFAULT_PROVIDER_NAME = "OpenAI";
 const APP_USER_MODEL_ID = "dev.codex-switch.app";
 const OFFICIAL_PROFILE_ID = "official-codex-chatgpt";
+const DEFAULT_DYNAMIC_ENDURANCE_SETTINGS: DynamicEnduranceSettings = {
+  enabled: false,
+  strategy: "economy"
+};
 const FORCE_EXIT_DELAY_MS = 500;
 const RELAY_BALANCE_TIMEOUT_MS = 2200;
 const OFFICIAL_USAGE_TIMEOUT_MS = 12000;
@@ -240,8 +248,8 @@ const knownProviders: Array<{
 
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 860,
+    width: 1280,
+    height: 780,
     minWidth: 1280,
     minHeight: 780,
     title: "Codex Switch",
@@ -462,6 +470,15 @@ function builtInTags(): ProfileTag[] {
   return DEFAULT_TAGS.map((tag) => ({ ...tag }));
 }
 
+function normalizeDynamicEnduranceSettings(raw?: Partial<DynamicEnduranceSettings>): DynamicEnduranceSettings {
+  return {
+    ...DEFAULT_DYNAMIC_ENDURANCE_SETTINGS,
+    ...(raw || {}),
+    enabled: Boolean(raw?.enabled),
+    strategy: raw?.strategy === "quality" ? "quality" : "economy"
+  };
+}
+
 async function readStore(): Promise<StoreFile> {
   const { storagePath } = paths();
   await ensureDir(dirname(storagePath));
@@ -473,7 +490,8 @@ async function readStore(): Promise<StoreFile> {
       tags: builtInTags(),
       preferences: {
         authKeyName: AUTH_API_KEY_FIELD,
-        providerName: DEFAULT_PROVIDER_NAME
+        providerName: DEFAULT_PROVIDER_NAME,
+        dynamicEndurance: normalizeDynamicEnduranceSettings()
       }
     };
   }
@@ -494,6 +512,7 @@ async function readStore(): Promise<StoreFile> {
       authKeyName: parsed.preferences?.authKeyName || AUTH_API_KEY_FIELD,
       providerName: parsed.preferences?.providerName || DEFAULT_PROVIDER_NAME,
       officialUsage: parsed.preferences?.officialUsage,
+      dynamicEndurance: normalizeDynamicEnduranceSettings(parsed.preferences?.dynamicEndurance),
       localUpdate: parsed.preferences?.localUpdate
     }
   };
@@ -904,6 +923,7 @@ async function getState(): Promise<AppState> {
       apiKeyPreview: current.apiKeyPreview,
       matchedProfileId: matched?.id
     },
+    dynamicEndurance: normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance),
     storagePath: location.storagePath,
     backupRoot: location.backupRoot
   };
@@ -2262,13 +2282,314 @@ async function refreshUsage(): Promise<OperationResult> {
       unsupportedCount ? `${unsupportedCount} 个未开放余额接口` : ""
     ].filter(Boolean);
     const detail = details.length ? `，${details.join("，")}` : "";
+    const dynamicResult = store.preferences.dynamicEndurance?.enabled ? await runDynamicEndurance(false) : undefined;
+    const dynamicDetail = dynamicResult ? `；${dynamicResult.message}` : "";
     return {
-      ok: true,
-      message: `额度已同步${detail}`,
+      ok: dynamicResult ? dynamicResult.ok : true,
+      message: `额度已同步${detail}${dynamicDetail}`,
+      restart: dynamicResult?.restart,
+      backupDir: dynamicResult?.backupDir,
+      profile: dynamicResult?.profile,
+      dynamicEndurance: dynamicResult?.dynamicEndurance,
       state: await getState()
     };
   } catch (error) {
     return { ok: false, message: normalizeError(error), state: await getState().catch(() => undefined) };
+  }
+}
+
+function dynamicStrategyLabel(strategy: DynamicEnduranceStrategy): string {
+  return strategy === "quality" ? "质量模式" : "经济模式";
+}
+
+function tagLevelRank(level?: ProfileTag["level"], preferLow = false): number {
+  if (!level) {
+    return 0;
+  }
+  if (preferLow) {
+    return level === "low" ? 3 : level === "medium" ? 2 : 1;
+  }
+  return level === "high" ? 3 : level === "medium" ? 2 : 1;
+}
+
+function profileTagLevel(profile: Pick<StoredProfile, "tagIds">, tags: ProfileTag[], metric: ProfileTag["metric"]): ProfileTag["level"] | undefined {
+  const tagIds = new Set(normalizeTagIds(profile.tagIds));
+  return tags.find((tag) => tag.metric === metric && tagIds.has(tag.id))?.level;
+}
+
+function parseUsageNumericValue(value: string): number | undefined {
+  const match = value.replace(/,/g, "").match(/(-?\d+(?:\.\d+)?)(\s*[kmbKMB])?/);
+  if (!match) {
+    return undefined;
+  }
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) {
+    return undefined;
+  }
+  const unit = match[2]?.trim().toUpperCase();
+  const scale = unit === "B" ? 1_000_000_000 : unit === "M" ? 1_000_000 : unit === "K" ? 1_000 : 1;
+  return base * scale;
+}
+
+function usageHasBalance(usage?: ProfileUsageSummary): boolean {
+  if (!usage || usage.status !== "ok") {
+    return false;
+  }
+  const numeric = parseUsageNumericValue(usage.value);
+  if (numeric !== undefined) {
+    return numeric > 0;
+  }
+  return !/^[$￥¥]?\s*0(?:\.0+)?\s*$/i.test(usage.value.trim());
+}
+
+function dynamicProfileScore(profile: StoredProfile, tags: ProfileTag[], strategy: DynamicEnduranceStrategy): number {
+  const price = tagLevelRank(profileTagLevel(profile, tags, "price"), true);
+  const stability = tagLevelRank(profileTagLevel(profile, tags, "stability"));
+  const speed = tagLevelRank(profileTagLevel(profile, tags, "speed"));
+  const dilution = tagLevelRank(profileTagLevel(profile, tags, "dilution"), true);
+  const balance = Math.min(99, Math.floor(Math.log10(Math.max(1, parseUsageNumericValue(profile.usage?.value || "") || 1)) * 10));
+  const updated = Date.parse(profile.lastAppliedAt || profile.updatedAt || profile.createdAt);
+  const freshness = Number.isFinite(updated) ? Math.min(99, Math.max(0, Math.floor((updated % 100000000) / 1000000))) : 0;
+
+  if (strategy === "quality") {
+    return stability * 100000 + price * 10000 + speed * 1000 + dilution * 100 + balance + freshness / 1000;
+  }
+  return price * 100000 + stability * 10000 + speed * 1000 + dilution * 100 + balance + freshness / 1000;
+}
+
+async function testStoredProfileConnection(profile: StoredProfile): Promise<{ ok: boolean; message: string }> {
+  let endpoint = "";
+  let controller: AbortController | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const apiKey = decryptSecret(profile);
+    if (!apiKey) {
+      throw new Error("这个配置没有可用 API Key");
+    }
+    const normalized = normalizeBaseUrl(profile.baseUrl);
+    endpoint = normalized.replace(/\/$/, "").endsWith("/v1") ? `${normalized}/models` : `${normalized}/v1/models`;
+    controller = new AbortController();
+    activeTestControllers.add(controller);
+    const startedAt = Date.now();
+    timeout = setTimeout(() => controller?.abort(), 9000);
+    activeTestTimeouts.add(timeout);
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      signal: controller.signal
+    });
+    const duration = Date.now() - startedAt;
+    if (!response.ok) {
+      const body = compactResponseText(await response.text().catch(() => ""));
+      const suffix = body ? `，响应：${body}` : "";
+      throw new Error(`GET ${compactEndpoint(endpoint)} 返回 ${response.status} ${response.statusText || ""}${suffix}`.trim());
+    }
+    return {
+      ok: true,
+      message: `GET ${compactEndpoint(endpoint)} 返回 ${response.status}，耗时 ${duration}ms`
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message:
+        error instanceof Error && error.name === "AbortError"
+          ? `GET ${compactEndpoint(endpoint || profile.baseUrl)} 超时（9 秒）`
+          : normalizeError(error)
+    };
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+      activeTestTimeouts.delete(timeout);
+    }
+    if (controller) {
+      activeTestControllers.delete(controller);
+    }
+  }
+}
+
+function applyDynamicEnduranceRun(
+  store: StoreFile,
+  patch: Pick<DynamicEnduranceSettings, "lastRunAt" | "lastMessage"> & Partial<DynamicEnduranceSettings>
+): DynamicEnduranceSettings {
+  const settings = normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance);
+  const next = {
+    ...settings,
+    ...patch
+  };
+  store.preferences.dynamicEndurance = next;
+  return next;
+}
+
+async function runDynamicEndurance(refreshBalances = true): Promise<OperationResult> {
+  let selectedId: string | undefined;
+  try {
+    const store = await readStore();
+    const settings = normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance);
+    const timestamp = nowIso();
+
+    if (!store.profiles.length) {
+      const dynamicEndurance = applyDynamicEnduranceRun(store, {
+        lastRunAt: timestamp,
+        lastMessage: "还没有保存的中转站配置"
+      });
+      await writeStore(store);
+      return {
+        ok: false,
+        message: dynamicEndurance.lastMessage || "还没有保存的中转站配置",
+        dynamicEndurance,
+        state: await getState()
+      };
+    }
+
+    if (refreshBalances) {
+      const relayUsages = await Promise.all(store.profiles.map((profile) => fetchRelayUsage(profile)));
+      store.profiles = store.profiles.map((profile, index) => ({
+        ...profile,
+        usage: relayUsages[index]
+      }));
+    }
+
+    const rankedProfiles = store.profiles
+      .filter((profile) => usageHasBalance(profile.usage))
+      .sort((left, right) => dynamicProfileScore(right, store.tags, settings.strategy) - dynamicProfileScore(left, store.tags, settings.strategy));
+
+    if (!rankedProfiles.length) {
+      const dynamicEndurance = applyDynamicEnduranceRun(store, {
+        lastRunAt: timestamp,
+        lastProfileId: undefined,
+        lastMessage: "没有找到有余额的可用中转站"
+      });
+      await writeStore(store);
+      return {
+        ok: false,
+        message: dynamicEndurance.lastMessage || "没有找到有余额的可用中转站",
+        dynamicEndurance,
+        state: await getState()
+      };
+    }
+
+    let selectedProfile: StoredProfile | undefined;
+    let lastFailure = "";
+    for (const profile of rankedProfiles) {
+      const test = await testStoredProfileConnection(profile);
+      profile.testStatus = test.ok ? "ok" : "failed";
+      profile.lastTestedAt = nowIso();
+      profile.lastTestMessage = test.message;
+      if (test.ok) {
+        selectedProfile = profile;
+        break;
+      }
+      lastFailure = `${profile.name}: ${test.message}`;
+    }
+
+    if (!selectedProfile) {
+      const dynamicEndurance = applyDynamicEnduranceRun(store, {
+        lastRunAt: timestamp,
+        lastProfileId: undefined,
+        lastMessage: lastFailure || "有余额的中转站都未通过连通性测试"
+      });
+      await writeStore(store);
+      return {
+        ok: false,
+        message: dynamicEndurance.lastMessage || "有余额的中转站都未通过连通性测试",
+        dynamicEndurance,
+        state: await getState()
+      };
+    }
+
+    selectedId = selectedProfile.id;
+    const current = await readCurrentConfig();
+    const alreadyActive =
+      normalizeComparableUrl(current.baseUrl) === normalizeComparableUrl(selectedProfile.baseUrl) &&
+      current.apiKeyHash === selectedProfile.apiKeyHash;
+    const mode = dynamicStrategyLabel(settings.strategy);
+    const successMessage = alreadyActive
+      ? `动态续航保持 ${selectedProfile.name}（${mode}）`
+      : `动态续航已切换到 ${selectedProfile.name}（${mode}）`;
+
+    if (alreadyActive) {
+      const dynamicEndurance = applyDynamicEnduranceRun(store, {
+        lastRunAt: timestamp,
+        lastProfileId: selectedProfile.id,
+        lastMessage: successMessage
+      });
+      await writeStore(store);
+      return {
+        ok: true,
+        message: successMessage,
+        profile: toPublicProfile(selectedProfile, current.baseUrl, current.apiKeyHash),
+        dynamicEndurance,
+        state: await getState()
+      };
+    }
+
+    await writeStore(store);
+    const applied = await applyProfile(selectedProfile.id);
+    const nextStore = await readStore();
+    const dynamicEndurance = applyDynamicEnduranceRun(nextStore, {
+      lastRunAt: nowIso(),
+      lastProfileId: selectedProfile.id,
+      lastMessage: applied.ok ? successMessage : applied.message
+    });
+    await writeStore(nextStore);
+
+    return {
+      ...applied,
+      ok: applied.ok,
+      message: applied.ok ? successMessage : applied.message,
+      dynamicEndurance,
+      state: await getState()
+    };
+  } catch (error) {
+    const store = await readStore().catch(() => undefined);
+    let dynamicEndurance: DynamicEnduranceSettings | undefined;
+    if (store) {
+      dynamicEndurance = applyDynamicEnduranceRun(store, {
+        lastRunAt: nowIso(),
+        lastProfileId: selectedId,
+        lastMessage: normalizeError(error)
+      });
+      await writeStore(store).catch(() => undefined);
+    }
+    return { ok: false, message: normalizeError(error), dynamicEndurance, state: await getState().catch(() => undefined) };
+  }
+}
+
+async function updateDynamicEndurance(input: UpdateDynamicEnduranceInput): Promise<OperationResult> {
+  try {
+    const store = await readStore();
+    const dynamicEndurance = normalizeDynamicEnduranceSettings({
+      ...store.preferences.dynamicEndurance,
+      enabled: input.enabled,
+      strategy: input.strategy
+    });
+    store.preferences.dynamicEndurance = dynamicEndurance;
+    await writeStore(store);
+    return {
+      ok: true,
+      message: dynamicEndurance.enabled
+        ? `动态续航已启用：${dynamicStrategyLabel(dynamicEndurance.strategy)}`
+        : "动态续航已关闭",
+      dynamicEndurance,
+      state: await getState()
+    };
+  } catch (error) {
+    return { ok: false, message: normalizeError(error), state: await getState().catch(() => undefined) };
+  }
+}
+
+async function runDynamicEnduranceIfEnabled(refreshBalances = true): Promise<void> {
+  try {
+    const store = await readStore();
+    if (!normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance).enabled) {
+      return;
+    }
+    await runDynamicEndurance(refreshBalances);
+  } catch {
+    // Startup checks should never block the main window.
   }
 }
 
@@ -2478,6 +2799,8 @@ async function restartCodexForConfigChange(beforeSignature: string, afterSignatu
 
   const script = `
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $main = @(Get-CimInstance Win32_Process | Where-Object {
   $_.Name -ieq 'Codex.exe' -and
   $_.CommandLine -notmatch '--type=' -and
@@ -2936,6 +3259,10 @@ function registerIpc(): void {
   ipcMain.handle("codex-switch:test-profile", (_event, input: TestProfileInput) => testProfile(input));
   ipcMain.handle("codex-switch:refresh-usage", () => refreshUsage());
   ipcMain.handle("codex-switch:connect-dashboard-auth", (_event, profileId: string) => connectDashboardAuth(profileId));
+  ipcMain.handle("codex-switch:update-dynamic-endurance", (_event, input: UpdateDynamicEnduranceInput) =>
+    updateDynamicEndurance(input)
+  );
+  ipcMain.handle("codex-switch:run-dynamic-endurance", () => runDynamicEndurance());
   ipcMain.handle("codex-switch:check-local-update", () => checkLocalUpdate());
   ipcMain.handle("codex-switch:install-local-update", () => installLocalUpdate());
   ipcMain.handle("codex-switch:reveal-path", async (_event, kind: "codexHome" | "storage" | "backupRoot") => {
@@ -2968,6 +3295,9 @@ app.whenReady().then(() => {
   void markPendingLocalUpdateInstalled()
     .catch(() => undefined)
     .finally(() => scheduleLocalUpdateChecks());
+  setTimeout(() => {
+    void runDynamicEnduranceIfEnabled(true);
+  }, 1800);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {

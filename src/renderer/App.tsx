@@ -1,6 +1,7 @@
 import {
   ArrowClockwise,
   ArrowUpRight,
+  BatteryCharging,
   CaretDown,
   ChartBar,
   Check,
@@ -8,12 +9,15 @@ import {
   ClipboardText,
   CloudCheck,
   CopySimple,
+  CurrencyCircleDollar,
   Database,
   Eye,
   EyeSlash,
   FloppyDisk,
   FolderOpen,
   FunnelSimple,
+  Gauge,
+  GearSix,
   Key,
   LinkSimple,
   Lightning,
@@ -22,16 +26,30 @@ import {
   PencilSimple,
   Plug,
   PlusCircle,
+  Pulse,
   ShieldCheck,
   SlidersHorizontal,
+  Shuffle,
   Tag,
+  ToggleLeft,
+  ToggleRight,
   Trash,
   WarningCircle,
   XCircle
 } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
-import type { AppState, CodexSwitchApi, OperationResult, ProfileTag, ProviderDetection, PublicProfile, TagMetric } from "../shared/types";
+import type {
+  AppState,
+  CodexSwitchApi,
+  DynamicEnduranceSettings,
+  DynamicEnduranceStrategy,
+  OperationResult,
+  ProfileTag,
+  ProviderDetection,
+  PublicProfile,
+  TagMetric
+} from "../shared/types";
 import { createMockCodexSwitchApi } from "./mockApi";
 import codexSwitchLogoUrl from "./assets/codexswitch-logo.png";
 
@@ -44,9 +62,11 @@ type BusyAction =
   | "importing"
   | "testing"
   | "connecting-dashboard"
+  | "saving-settings"
+  | "dynamic-endurance"
   | null;
 
-type ActiveView = "overview" | "profiles" | "tags";
+type ActiveView = "profiles" | "settings";
 
 interface FormState {
   baseUrl: string;
@@ -74,6 +94,11 @@ const emptyForm: FormState = {
   apiKey: "",
   name: "",
   tagIds: []
+};
+
+const DEFAULT_DYNAMIC_ENDURANCE: DynamicEnduranceSettings = {
+  enabled: false,
+  strategy: "economy" as DynamicEnduranceStrategy
 };
 
 const metricLabels: Record<TagMetric, string> = {
@@ -480,6 +505,40 @@ function App(): ReactElement {
     }
   }
 
+  async function handleUpdateDynamicEndurance(patch: { enabled?: boolean; strategy?: DynamicEnduranceStrategy }): Promise<void> {
+    const currentSettings = state?.dynamicEndurance || DEFAULT_DYNAMIC_ENDURANCE;
+    setBusy("saving-settings");
+    try {
+      const result = await api.updateDynamicEndurance({
+        enabled: patch.enabled ?? currentSettings.enabled,
+        strategy: patch.strategy ?? currentSettings.strategy
+      });
+      applyResult(result);
+      showToast({
+        tone: result.ok ? "ok" : "warn",
+        title: result.ok ? "设置已保存" : "设置保存失败",
+        detail: result.message
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleRunDynamicEndurance(): Promise<void> {
+    setBusy("dynamic-endurance");
+    try {
+      const result = await api.runDynamicEndurance();
+      applyResult(result);
+      showToast({
+        tone: result.ok ? "ok" : "warn",
+        title: result.ok ? "动态续航已完成" : "动态续航未完成",
+        detail: result.restart?.message || result.message
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function handleToggleProfileTag(profile: PublicProfile, tagId: string): Promise<void> {
     const nextIds = toggleMetricTag(profile.tagIds, tagId, tags);
     setBusy("saving");
@@ -541,6 +600,18 @@ function App(): ReactElement {
   const visibleProfiles = filteredProfiles.slice(profilePage * profilesPerPage, profilePage * profilesPerPage + profilesPerPage);
   const modalProfile = profileModalMode === "edit" ? profiles.find((profile) => profile.id === editingProfileId) : undefined;
   const modalForm = profileModalMode === "edit" ? editForm : form;
+  const dynamicEndurance = state?.dynamicEndurance || DEFAULT_DYNAMIC_ENDURANCE;
+  const balanceReadyProfiles = customProfiles.filter((profile) => profile.usage?.status === "ok" && usageHasBalance(profile.usage?.value));
+  const connectedProfiles = customProfiles.filter((profile) => profile.testStatus === "ok");
+  const dynamicReadyProfiles = balanceReadyProfiles.filter((profile) => profile.testStatus === "ok");
+  const dynamicPreviewProfiles = [...balanceReadyProfiles]
+    .sort(
+      (left, right) =>
+        dynamicPreviewScore(right, tags, dynamicEndurance.strategy) -
+        dynamicPreviewScore(left, tags, dynamicEndurance.strategy)
+    )
+    .slice(0, 5);
+  const lastDynamicProfile = profiles.find((profile) => profile.id === dynamicEndurance.lastProfileId);
 
   useEffect(() => {
     if (profilePage > profilePageCount - 1) {
@@ -565,14 +636,11 @@ function App(): ReactElement {
           <img src={codexSwitchLogoUrl} alt="" />
         </div>
         <nav className="rail-nav">
-          <button className={activeView === "overview" ? "active" : ""} onClick={() => setActiveView("overview")} title="工作台">
-            <Plug size={19} weight={activeView === "overview" ? "fill" : "regular"} />
-          </button>
           <button className={activeView === "profiles" ? "active" : ""} onClick={() => setActiveView("profiles")} title="配置库">
             <Database size={19} weight={activeView === "profiles" ? "fill" : "regular"} />
           </button>
-          <button className={activeView === "tags" ? "active" : ""} onClick={() => setActiveView("tags")} title="标签管理">
-            <Tag size={19} weight={activeView === "tags" ? "fill" : "regular"} />
+          <button className={activeView === "settings" ? "active" : ""} onClick={() => setActiveView("settings")} title="设置">
+            <GearSix size={19} weight={activeView === "settings" ? "fill" : "regular"} />
           </button>
         </nav>
         <div className="rail-bottom">
@@ -589,162 +657,6 @@ function App(): ReactElement {
       </aside>
 
       <section className="workspace">
-        {activeView === "overview" && (
-          <section className="view-panel overview-view">
-            <section className="overview-card">
-              <div className="metric-block">
-                <strong>{customProfiles.length}</strong>
-                <span>已保存中转站配置</span>
-              </div>
-              <div className="readiness-block">
-                <div className="readiness-copy">
-                  <strong>{readinessPercent}%</strong>
-                  <span>配置就绪度</span>
-                </div>
-                <div className="readiness-bar" aria-label="配置就绪度">
-                  <span style={{ width: `${Math.max(readinessPercent, 8)}%` }} />
-                </div>
-              </div>
-              <div className="overview-actions">
-                <button
-                  className="icon-action"
-                  onClick={() => {
-                    void refreshState();
-                    void refreshUsage(false);
-                  }}
-                  disabled={isWorking}
-                  title="刷新"
-                >
-                  <ArrowClockwise size={18} />
-                </button>
-              </div>
-            </section>
-
-            <div className="status-grid">
-              <StatusTile
-                icon={<Plug size={20} />}
-                label="当前中转站地址"
-                value={current?.baseUrl || "未读取到配置"}
-                tone={current?.baseUrl ? "ok" : "warn"}
-              />
-              <StatusTile
-                icon={<Key size={20} />}
-                label={current?.authKeyName ? `auth.json · ${current.authKeyName}` : DEFAULT_AUTH_LABEL}
-                value={current?.hasApiKey ? current.apiKeyPreview || "已设置" : "未设置"}
-                tone={current?.hasApiKey ? "ok" : "warn"}
-              />
-              <StatusTile
-                icon={<ShieldCheck size={20} />}
-                label="当前匹配"
-                value={activeProfileName}
-                tone={current?.matchedProfileId ? "ok" : "neutral"}
-              />
-            </div>
-
-            <div className="overview-grid">
-              <section className="panel input-panel">
-                <div className="panel-head">
-                  <div>
-                    <h3>添加中转站</h3>
-                    <p>输入服务商给你的地址和 Key，名称与图标会自动识别。</p>
-                  </div>
-                  {detected && (
-                    <div className="detected-chip">
-                      <ProviderIcon profile={detected} compact />
-                      <span>{detected.name}</span>
-                    </div>
-                  )}
-                </div>
-
-                <form onSubmit={(event) => void handleSave(event, false)} className="switch-form">
-                  <label>
-                    <span>中转站地址</span>
-                    <div className="input-shell">
-                      <LinkSimple size={18} />
-                      <input
-                        value={form.baseUrl}
-                        onChange={(event) => setForm((currentForm) => ({ ...currentForm, baseUrl: event.target.value }))}
-                        placeholder="https://relay.example.com"
-                        autoComplete="off"
-                      />
-                    </div>
-                  </label>
-
-                  <label>
-                    <span>API Key</span>
-                    <div className="input-shell">
-                      <Key size={18} />
-                      <input
-                        value={form.apiKey}
-                        onChange={(event) => setForm((currentForm) => ({ ...currentForm, apiKey: event.target.value }))}
-                        placeholder="sk-..."
-                        type={showKey ? "text" : "password"}
-                        autoComplete="off"
-                      />
-                      <button type="button" className="inline-icon" onClick={() => setShowKey((value) => !value)}>
-                        {showKey ? <EyeSlash size={18} /> : <Eye size={18} />}
-                      </button>
-                    </div>
-                  </label>
-
-                  <label>
-                    <span>显示名称</span>
-                    <div className="input-shell">
-                      <MagicWand size={18} />
-                      <input
-                        value={form.name}
-                        onChange={(event) => setForm((currentForm) => ({ ...currentForm, name: event.target.value }))}
-                        placeholder={detected?.name || "自动识别"}
-                        autoComplete="off"
-                      />
-                    </div>
-                  </label>
-
-                  <label>
-                    <span>标签</span>
-                    <TagSelector
-                      tags={tags}
-                      selectedIds={form.tagIds}
-                      onToggle={(tagId) =>
-                        setForm((currentForm) => ({
-                          ...currentForm,
-                          tagIds: toggleMetricTag(currentForm.tagIds, tagId, tags)
-                        }))
-                      }
-                    />
-                  </label>
-
-                  <div className="form-actions">
-                    <button
-                      type="button"
-                      className="secondary-action"
-                      onClick={handleTestCurrentForm}
-                      disabled={isWorking || !form.baseUrl || !form.apiKey}
-                    >
-                      <CloudCheck size={18} />
-                      测试
-                    </button>
-                    <button type="submit" className="secondary-action" disabled={isWorking || !form.baseUrl || !form.apiKey}>
-                      <FloppyDisk size={18} />
-                      保存
-                    </button>
-                    <button
-                      type="button"
-                      className="primary-action"
-                      disabled={isWorking || !form.baseUrl || !form.apiKey}
-                      onClick={(event) => void handleSave(event, true)}
-                    >
-                      <Lightning size={18} weight="fill" />
-                      保存并切换
-                    </button>
-                  </div>
-                </form>
-              </section>
-
-            </div>
-          </section>
-        )}
-
         {activeView === "profiles" && (
           <section className="view-panel profiles-view subscriptions-view">
             <section className="subscriptions-panel">
@@ -847,14 +759,154 @@ function App(): ReactElement {
           </section>
         )}
 
-        {activeView === "tags" && (
-          <section className="view-panel tags-view">
-            <section className="panel tag-management-panel">
-              <TagManagementBoard tags={tags} profiles={customProfiles} />
-            </section>
+        {activeView === "settings" && (
+          <section className="view-panel settings-view">
+            <section className="settings-panel">
+              <div className="settings-header">
+                <div>
+                  <span>Settings</span>
+                  <h1>设置</h1>
+                </div>
+                <button
+                  className="sync-usage-button"
+                  onClick={() => void refreshUsage(true)}
+                  disabled={usageRefreshing || isWorking}
+                  title="同步中转站余额与官方余量"
+                >
+                  <ArrowClockwise size={17} className={usageRefreshing ? "spinning" : ""} />
+                  {usageRefreshing ? "同步中" : "同步额度"}
+                </button>
+              </div>
 
-            <section className="panel tag-insight-panel">
-              <TagInsightPanel tags={tags} profiles={customProfiles} />
+              <div className="settings-grid">
+                <section className="settings-card dynamic-card">
+                  <div className="settings-card-head">
+                    <span className="settings-icon">
+                      <BatteryCharging size={22} />
+                    </span>
+                    <div>
+                      <h2>动态续航</h2>
+                      <p>{dynamicEndurance.enabled ? "已启用" : "已关闭"}</p>
+                    </div>
+                    <button
+                      className={`switch-toggle ${dynamicEndurance.enabled ? "on" : ""}`}
+                      onClick={() => void handleUpdateDynamicEndurance({ enabled: !dynamicEndurance.enabled })}
+                      disabled={isWorking}
+                      aria-pressed={dynamicEndurance.enabled}
+                    >
+                      {dynamicEndurance.enabled ? <ToggleRight size={24} weight="fill" /> : <ToggleLeft size={24} />}
+                      {dynamicEndurance.enabled ? "开启" : "关闭"}
+                    </button>
+                  </div>
+
+                  <div className="strategy-options" aria-label="动态续航策略">
+                    <button
+                      className={dynamicEndurance.strategy === "economy" ? "selected" : ""}
+                      onClick={() => void handleUpdateDynamicEndurance({ strategy: "economy" })}
+                      disabled={isWorking}
+                    >
+                      <CurrencyCircleDollar size={20} />
+                      <span>
+                        <strong>经济模式</strong>
+                        <small>价格低优先</small>
+                      </span>
+                    </button>
+                    <button
+                      className={dynamicEndurance.strategy === "quality" ? "selected" : ""}
+                      onClick={() => void handleUpdateDynamicEndurance({ strategy: "quality" })}
+                      disabled={isWorking}
+                    >
+                      <Pulse size={20} />
+                      <span>
+                        <strong>质量模式</strong>
+                        <small>稳定高优先</small>
+                      </span>
+                    </button>
+                  </div>
+
+                  <div className="settings-action-row">
+                    <button
+                      className="primary-action"
+                      onClick={() => void handleRunDynamicEndurance()}
+                      disabled={isWorking || !dynamicEndurance.enabled}
+                    >
+                      <Shuffle size={18} />
+                      {busy === "dynamic-endurance" ? "分配中" : "立即分配"}
+                    </button>
+                    <button className="secondary-action" onClick={() => void api.revealPath("storage")} disabled={isWorking}>
+                      <Database size={18} />
+                      配置文件
+                    </button>
+                  </div>
+                </section>
+
+                <section className="settings-card">
+                  <div className="settings-card-head compact">
+                    <span className="settings-icon muted">
+                      <Gauge size={21} />
+                    </span>
+                    <div>
+                      <h2>候选状态</h2>
+                      <p>{dynamicReadyProfiles.length ? `${dynamicReadyProfiles.length} 个可直接分配` : "等待可用候选"}</p>
+                    </div>
+                  </div>
+                  <div className="settings-stat-grid">
+                    <div>
+                      <span>有余额</span>
+                      <strong>{balanceReadyProfiles.length}</strong>
+                    </div>
+                    <div>
+                      <span>可连接</span>
+                      <strong>{connectedProfiles.length}</strong>
+                    </div>
+                    <div>
+                      <span>就绪</span>
+                      <strong>{dynamicReadyProfiles.length}</strong>
+                    </div>
+                  </div>
+                  <div className="settings-last-run">
+                    <span>上次结果</span>
+                    <strong>{dynamicEndurance.lastMessage || "暂无记录"}</strong>
+                    <small>{lastDynamicProfile ? lastDynamicProfile.name : formatDate(dynamicEndurance.lastRunAt) || "尚未运行"}</small>
+                  </div>
+                </section>
+
+                <section className="settings-card settings-wide">
+                  <div className="settings-card-head compact">
+                    <span className="settings-icon muted">
+                      <Shuffle size={21} />
+                    </span>
+                    <div>
+                      <h2>候选队列</h2>
+                      <p>{dynamicEndurance.strategy === "quality" ? "按稳定标签排序" : "按价格标签排序"}</p>
+                    </div>
+                  </div>
+
+                  {dynamicPreviewProfiles.length ? (
+                    <div className="dynamic-candidate-list">
+                      {dynamicPreviewProfiles.map((profile, index) => (
+                        <div className="dynamic-candidate-row" key={profile.id}>
+                          <span className="candidate-rank">{index + 1}</span>
+                          <ProviderIcon profile={profile} compact />
+                          <span>
+                            <strong>{profile.name}</strong>
+                            <small>{profile.usage?.value || profile.host}</small>
+                          </span>
+                          <ProfileTagList tagIds={profile.tagIds} tags={tags} />
+                          <em className={profile.testStatus === "ok" ? "ok" : profile.testStatus === "failed" ? "failed" : ""}>
+                            {rowStatusLabel(profile)}
+                          </em>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty-state settings-empty">
+                      <BatteryCharging size={28} />
+                      <p>暂无有余额的中转站</p>
+                    </div>
+                  )}
+                </section>
+              </div>
             </section>
           </section>
         )}
@@ -963,6 +1015,51 @@ function App(): ReactElement {
 }
 
 const DEFAULT_AUTH_LABEL = "auth.json · OPENAI_API_KEY";
+
+function parseUsageNumber(value?: string): number | undefined {
+  const match = (value || "").replace(/,/g, "").match(/(-?\d+(?:\.\d+)?)(\s*[kmbKMB])?/);
+  if (!match) {
+    return undefined;
+  }
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) {
+    return undefined;
+  }
+  const unit = match[2]?.trim().toUpperCase();
+  const scale = unit === "B" ? 1_000_000_000 : unit === "M" ? 1_000_000 : unit === "K" ? 1_000 : 1;
+  return base * scale;
+}
+
+function usageHasBalance(value?: string): boolean {
+  const parsed = parseUsageNumber(value);
+  if (parsed !== undefined) {
+    return parsed > 0;
+  }
+  return Boolean(value && !/^[$￥¥]?\s*0(?:\.0+)?\s*$/i.test(value.trim()));
+}
+
+function levelRank(level?: ProfileTag["level"], preferLow = false): number {
+  if (!level) {
+    return 0;
+  }
+  if (preferLow) {
+    return level === "low" ? 3 : level === "medium" ? 2 : 1;
+  }
+  return level === "high" ? 3 : level === "medium" ? 2 : 1;
+}
+
+function dynamicPreviewScore(profile: PublicProfile, tags: ProfileTag[], strategy: DynamicEnduranceStrategy): number {
+  const price = levelRank(selectedMetricTag(profile.tagIds, tags, "price")?.level, true);
+  const stability = levelRank(selectedMetricTag(profile.tagIds, tags, "stability")?.level);
+  const speed = levelRank(selectedMetricTag(profile.tagIds, tags, "speed")?.level);
+  const dilution = levelRank(selectedMetricTag(profile.tagIds, tags, "dilution")?.level, true);
+  const balance = Math.min(99, Math.floor(Math.log10(Math.max(1, parseUsageNumber(profile.usage?.value) || 1)) * 10));
+
+  if (strategy === "quality") {
+    return stability * 100000 + price * 10000 + speed * 1000 + dilution * 100 + balance;
+  }
+  return price * 100000 + stability * 10000 + speed * 1000 + dilution * 100 + balance;
+}
 
 function toggleMetricTag(ids: string[], id: string, tags: ProfileTag[]): string[] {
   const tag = tags.find((item) => item.id === id);
