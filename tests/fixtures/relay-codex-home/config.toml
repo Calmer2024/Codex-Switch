@@ -1,0 +1,11 @@
+model_provider = "codex_switch"
+cli_auth_credentials_store = "file"
+
+[model_providers.codex_switch]
+name = "Codex Switch"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[model_providers.codex_switch.auth]
+command = "fixture.exe"
+args = ["--print-provider-token", "fixture-profile"]

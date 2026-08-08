@@ -1,24 +1,29 @@
 {
   "name": "codex-switch",
-  "version": "1.0.7",
+  "version": "1.0.11",
   "description": "A Windows desktop tool for switching Codex relay configurations.",
   "author": "Codex Switch",
   "private": true,
   "main": "out/main/index.js",
   "productName": "Codex Switch",
   "scripts": {
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/*.test.ts",
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite dev\"",
     "preview": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron-vite preview\"",
     "build": "tsc --noEmit && electron-vite build",
+    "stop:local-app": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-installed-app.ps1",
+    "clean:release": "node scripts/clean-release.mjs",
+    "prune:release": "node scripts/prune-release.mjs",
     "prepare:local-update": "node scripts/write-dev-update-config.mjs",
-    "dist": "npm run prepare:local-update && npm run build && electron-builder --win nsis portable",
-    "dist:installer": "npm run prepare:local-update && npm run build && electron-builder --win nsis",
-    "dist:portable": "npm run prepare:local-update && npm run build && electron-builder --win portable",
-    "dist:install": "npm run dist:installer && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$installer = Get-ChildItem -Path .\\release -Filter '*Setup*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $installer) { throw 'Installer not found' }; Start-Process -FilePath $installer.FullName -Wait\"",
-    "pack": "npm run prepare:local-update && npm run build && electron-builder --dir"
+    "dist": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win nsis portable && npm run prune:release",
+    "dist:installer": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win nsis && npm run prune:release",
+    "dist:portable": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win portable && npm run prune:release",
+    "dist:install": "npm run stop:local-app && npm run dist:installer && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$installer = Join-Path (Resolve-Path .\\release) ('Codex-Switch-Setup-' + $env:npm_package_version + '.exe'); if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer not found' }; $process = Start-Process -FilePath $installer -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden; if ($process.ExitCode -ne 0) { throw ('Installer failed with exit code ' + $process.ExitCode) }\"",
+    "pack": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --dir"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
+    "lucide-react": "^0.468.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
