@@ -46,6 +46,8 @@ const officialProfile: PublicProfile = {
   known: true,
   apiKeyPreview: "ChatGPT 登录",
   apiKeyHash: "",
+  apiKeys: [],
+  activeApiKeyId: "",
   createdAt: new Date(2026, 5, 20).toISOString(),
   updatedAt: new Date(2026, 5, 20).toISOString(),
   tagIds: [],
@@ -88,6 +90,8 @@ function makeProfile(index: number): PublicProfile {
     index % 2 === 0 ? "speed-high" : "speed-medium"
   ];
 
+  const apiKeyId = `mock-key-${index + 1}`;
+  const apiKeyPreview = `sk-${String(index + 1).padStart(2, "0")}...demo`;
   return {
     id: `mock-${index + 1}`,
     kind: "custom",
@@ -101,8 +105,18 @@ function makeProfile(index: number): PublicProfile {
     iconCandidates: [],
     color: colors[index],
     known: index < 7,
-    apiKeyPreview: `sk-${String(index + 1).padStart(2, "0")}...demo`,
+    apiKeyPreview,
     apiKeyHash: `hash-${index + 1}`,
+    apiKeys: [{
+      id: apiKeyId,
+      preview: apiKeyPreview,
+      hash: `hash-${index + 1}`,
+      notes: index % 2 === 0 ? "低价按量计费" : "高并发线路",
+      createdAt: new Date(2026, 5, 20 + index).toISOString(),
+      updatedAt: new Date(2026, 5, 21 + index).toISOString(),
+      isActive: true
+    }],
+    activeApiKeyId: apiKeyId,
     createdAt: new Date(2026, 5, 20 + index).toISOString(),
     updatedAt: new Date(2026, 5, 21 + index).toISOString(),
     lastAppliedAt: index === 1 ? new Date(2026, 5, 26, 16, 32).toISOString() : undefined,
@@ -143,7 +157,9 @@ let mockState: AppState = {
     authKeyName: "OPENAI_API_KEY",
     hasApiKey: true,
     apiKeyPreview: "sk-02...demo",
-    matchedProfileId: "mock-2"
+    matchedProfileId: "mock-2",
+    connectionKind: "relay",
+    connectionMessage: "正在使用中转站：https://openrouter.ai/v1"
   },
   dynamicEndurance: {
     enabled: true,
@@ -209,6 +225,11 @@ function dynamicStrategyLabel(strategy: DynamicEnduranceStrategy): string {
 export function createMockCodexSwitchApi(): CodexSwitchApi {
   return {
     getState: async () => mockState,
+    readProfileFile: async () => ({
+      path: mockState.storagePath,
+      content: `${JSON.stringify({ schemaVersion: 1, profiles: mockState.profiles, tags: mockState.tags }, null, 2)}\n`,
+      updatedAt: new Date().toISOString()
+    }),
     detectProvider: async (baseUrl: string) => detect(baseUrl),
     saveProfile: async (input: SaveProfileInput) => {
       const detection = detect(input.baseUrl);
@@ -223,6 +244,19 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
         tagIds: input.tagIds || existing?.tagIds || [],
         updatedAt: new Date().toISOString()
       };
+      if (input.apiKey) {
+        const id = profile.activeApiKeyId || crypto.randomUUID();
+        profile.activeApiKeyId = id;
+        profile.apiKeys = [{
+          id,
+          preview: profile.apiKeyPreview,
+          hash: profile.apiKeyHash,
+          notes: input.apiKeyNotes,
+          createdAt: existing?.apiKeys[0]?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          isActive: true
+        }, ...(existing?.apiKeys.filter((key) => key.id !== id) || [])];
+      }
       mockState = {
         ...mockState,
         profiles: existing
@@ -231,9 +265,12 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
       };
       return result(existing ? "配置已更新" : "配置已创建", profile);
     },
-    applyProfile: async (profileId: string) => {
+    applyProfile: async (profileId: string, apiKeyId?: string) => {
       const nextProfiles = mockState.profiles.map((profile) => ({
         ...profile,
+        apiKeys: profile.apiKeys.map((key) => ({ ...key, isActive: profile.id === profileId && apiKeyId ? key.id === apiKeyId : key.isActive })),
+        activeApiKeyId: profile.id === profileId && apiKeyId ? apiKeyId : profile.activeApiKeyId,
+        apiKeyPreview: profile.id === profileId && apiKeyId ? profile.apiKeys.find((key) => key.id === apiKeyId)?.preview || profile.apiKeyPreview : profile.apiKeyPreview,
         isActive: profile.id === profileId,
         lastAppliedAt: profile.id === profileId ? new Date().toISOString() : profile.lastAppliedAt
       }));
@@ -253,6 +290,7 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
         ...result(active?.builtin ? "已切换到官方 Codex，并打开登录窗口" : "已切换配置", active),
         loginStarted: Boolean(active?.builtin),
         restart: {
+          status: "deferred",
           needed: true,
           attempted: false,
           restarted: false,
@@ -260,6 +298,26 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
           message: "开发预览不会重启 Codex"
         }
       };
+    },
+    saveProfileApiKey: async (input) => {
+      const profile = mockState.profiles.find((item) => item.id === input.profileId);
+      if (!profile) return { ok: false, message: "找不到这个配置" };
+      const timestamp = new Date().toISOString();
+      const key = {
+        id: crypto.randomUUID(),
+        preview: `${input.apiKey.slice(0, 4)}...${input.apiKey.slice(-4)}`,
+        hash: crypto.randomUUID(),
+        notes: input.notes,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        isActive: false
+      };
+      mockState = { ...mockState, profiles: mockState.profiles.map((item) => item.id === profile.id ? { ...item, apiKeys: [...item.apiKeys, key] } : item) };
+      return result("API Key 已添加");
+    },
+    deleteProfileApiKey: async (profileId, apiKeyId) => {
+      mockState = { ...mockState, profiles: mockState.profiles.map((profile) => profile.id === profileId ? { ...profile, apiKeys: profile.apiKeys.filter((key) => key.id !== apiKeyId) } : profile) };
+      return result("API Key 已删除");
     },
     deleteProfile: async (profileId: string) => {
       mockState = {
@@ -347,6 +405,7 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
         ...result(mockState.dynamicEndurance.lastMessage || "动态续航已完成", selected),
         dynamicEndurance: mockState.dynamicEndurance,
         restart: {
+          status: "deferred",
           needed: true,
           attempted: false,
           restarted: false,
@@ -394,9 +453,15 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
       ok: false,
       message: "开发预览不安装更新"
     }),
+    restartCodex: async () => result("开发预览不会重启 Codex"),
     restoreBackup: async (backupId: string) => {
       const backup = mockState.backups.find((item) => item.id === backupId);
       return backup ? result(`已恢复 ${backup.profileName} 的备份`) : { ok: false, message: "备份记录不存在" };
+    },
+    deleteBackups: async (backupIds: string[]) => {
+      const before = mockState.backups.length;
+      mockState = { ...mockState, backups: mockState.backups.filter((backup) => !backupIds.includes(backup.id)) };
+      return result(`已清理 ${before - mockState.backups.length} 条备份`);
     },
     revealPath: async () => undefined,
     openExternal: async () => undefined

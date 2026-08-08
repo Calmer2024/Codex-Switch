@@ -7,6 +7,8 @@ import {
   ChartBar,
   Check,
   CheckCircle,
+  CheckSquare,
+  Checks,
   ClipboardText,
   ClockCounterClockwise,
   CloudCheck,
@@ -32,6 +34,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Shuffle,
+  Square,
   Tag,
   ToggleLeft,
   ToggleRight,
@@ -39,6 +42,14 @@ import {
   WarningCircle,
   XCircle
 } from "@phosphor-icons/react";
+import {
+  Check as LucideCheck,
+  ChevronDown as LucideChevronDown,
+  Eye as LucideEye,
+  EyeOff as LucideEyeOff,
+  Plus as LucidePlus,
+  Trash2 as LucideTrash2
+} from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import type {
@@ -49,6 +60,7 @@ import type {
   OperationResult,
   BackupRecord,
   ProfileTag,
+  ProfileFileSnapshot,
   ProviderDetection,
   PublicProfile,
   TagMetric
@@ -62,19 +74,24 @@ type BusyAction =
   | "saving-switching"
   | "applying"
   | "deleting"
+  | "saving-key"
+  | "deleting-key"
   | "importing"
   | "testing"
   | "connecting-dashboard"
   | "saving-settings"
   | "dynamic-endurance"
   | "restoring-backup"
+  | "deleting-backups"
+  | "restarting-codex"
   | null;
 
-type ActiveView = "profiles" | "backups" | "settings";
+type ActiveView = "profiles" | "profile-file" | "backups" | "settings";
 
 interface FormState {
   baseUrl: string;
   apiKey: string;
+  apiKeyNotes: string;
   name: string;
   tagIds: string[];
 }
@@ -96,6 +113,7 @@ interface ToastState {
 const emptyForm: FormState = {
   baseUrl: "",
   apiKey: "",
+  apiKeyNotes: "",
   name: "",
   tagIds: []
 };
@@ -136,6 +154,10 @@ function App(): ReactElement {
   const [detected, setDetected] = useState<ProviderDetection | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>("profiles");
+  const [profileFile, setProfileFile] = useState<ProfileFileSnapshot | null>(null);
+  const [profileFileError, setProfileFileError] = useState("");
+  const [profileFileRevision, setProfileFileRevision] = useState(0);
+  const [restartPromptOpen, setRestartPromptOpen] = useState(false);
   const [profilePage, setProfilePage] = useState(0);
   const [activeTagFilter, setActiveTagFilter] = useState<string>("all");
   const [profileSearch, setProfileSearch] = useState("");
@@ -148,6 +170,8 @@ function App(): ReactElement {
   const [connectingDashboardProfileId, setConnectingDashboardProfileId] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [backupSelectionMode, setBackupSelectionMode] = useState(false);
+  const [selectedBackupIds, setSelectedBackupIds] = useState<string[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([
     {
       id: "boot",
@@ -165,6 +189,16 @@ function App(): ReactElement {
   useEffect(() => {
     void bootstrapState();
   }, []);
+
+  useEffect(() => {
+    if (activeView !== "profile-file") {
+      return;
+    }
+    setProfileFileError("");
+    void api.readProfileFile().then(setProfileFile).catch((error: unknown) => {
+      setProfileFileError(error instanceof Error ? error.message : String(error));
+    });
+  }, [activeView, api, profileFileRevision]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -272,6 +306,7 @@ function App(): ReactElement {
       const saved = await api.saveProfile({
         baseUrl: form.baseUrl,
         apiKey: form.apiKey,
+        apiKeyNotes: form.apiKeyNotes,
         name: form.name || detected?.name,
         tagIds: form.tagIds
       });
@@ -304,6 +339,7 @@ function App(): ReactElement {
         id: profile.id,
         baseUrl: editForm.baseUrl,
         apiKey: editForm.apiKey.trim() || undefined,
+        apiKeyNotes: editForm.apiKeyNotes,
         name: editForm.name,
         tagIds: editForm.tagIds
       });
@@ -329,6 +365,7 @@ function App(): ReactElement {
     setEditForm({
       baseUrl: profile.baseUrl,
       apiKey: "",
+      apiKeyNotes: profile.apiKeys.find((key) => key.isActive)?.notes || "",
       name: profile.name,
       tagIds: profile.tagIds
     });
@@ -379,10 +416,10 @@ function App(): ReactElement {
     setProfileModalMode(null);
   }
 
-  async function handleApply(profileId: string): Promise<void> {
+  async function handleApply(profileId: string, apiKeyId?: string): Promise<void> {
     setBusy("applying");
     try {
-      const result = await api.applyProfile(profileId);
+      const result = await api.applyProfile(profileId, apiKeyId);
       applyResult(result, result.backupDir ? `备份: ${result.backupDir}` : undefined);
       if (result.ok) {
         void refreshUsage(false);
@@ -395,11 +432,64 @@ function App(): ReactElement {
         });
       } else if (result.ok && result.restart) {
         showToast({
-          tone: result.restart.restarted ? "ok" : "info",
-          title: result.restart.restarted ? "Codex 已自动重启" : "Codex 未重启",
+          tone: "info",
+          title: "配置已安全保存",
           detail: result.restart.message
         });
+        setRestartPromptOpen(true);
       }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleSaveProfileApiKey(profileId: string, apiKey: string, notes: string): Promise<boolean> {
+    setBusy("saving-key");
+    try {
+      const result = await api.saveProfileApiKey({ profileId, apiKey, notes });
+      applyResult(result);
+      showToast({ tone: result.ok ? "ok" : "warn", title: result.ok ? "API Key 已添加" : "添加失败", detail: result.message });
+      return result.ok;
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleDeleteProfileApiKey(profileId: string, apiKeyId: string): Promise<void> {
+    if (!window.confirm("删除这个 API Key？")) {
+      return;
+    }
+    setBusy("deleting-key");
+    try {
+      const result = await api.deleteProfileApiKey(profileId, apiKeyId);
+      applyResult(result);
+      showToast({ tone: result.ok ? "ok" : "warn", title: result.ok ? "API Key 已删除" : "删除失败", detail: result.message });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleSafeRestart(): Promise<void> {
+    setRestartPromptOpen(false);
+    setBusy("restarting-codex");
+    try {
+      const restarted = await api.restartCodex();
+      const restartStatus = restarted.restart?.status;
+      const restartTitle = restartStatus === "restarted"
+        ? "Codex 已安全重启"
+        : restartStatus === "not-running"
+          ? "Codex 当前未运行"
+          : restartStatus === "cancelled-active-task"
+            ? "检测到活动任务，已取消重启"
+            : restartStatus === "refused"
+              ? "Codex 拒绝安全退出"
+              : "安全重启失败";
+      showToast({
+        tone: restartStatus === "restarted" ? "ok" : restartStatus === "not-running" ? "info" : "warn",
+        title: restartTitle,
+        detail: restarted.message
+      });
+      addLog({ tone: restarted.ok ? "ok" : "warn", message: restarted.message });
     } finally {
       setBusy(null);
     }
@@ -583,18 +673,44 @@ function App(): ReactElement {
     }
   }
 
+  function toggleBackupSelection(backupId: string): void {
+    setSelectedBackupIds((current) =>
+      current.includes(backupId) ? current.filter((id) => id !== backupId) : [...current, backupId]
+    );
+  }
+
+  function closeBackupSelection(): void {
+    setBackupSelectionMode(false);
+    setSelectedBackupIds([]);
+  }
+
+  async function handleDeleteBackups(backupIds: string[], scopeLabel: string): Promise<void> {
+    if (!backupIds.length) {
+      showToast({ tone: "warn", title: "尚未选择备份", detail: "请至少选择一条备份记录。" });
+      return;
+    }
+    if (!window.confirm(`确定${scopeLabel}？\n\n此操作不可撤销。`)) {
+      return;
+    }
+    setBusy("deleting-backups");
+    try {
+      const result = await api.deleteBackups(backupIds);
+      applyResult(result);
+      if (result.ok) {
+        closeBackupSelection();
+      }
+      showToast({ tone: result.ok ? "ok" : "warn", title: result.ok ? "备份已清理" : "清理失败", detail: result.message });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const profiles = state?.profiles || [];
   const backups = state?.backups || [];
   const customProfiles = profiles.filter((profile) => !profile.builtin);
   const tags = state?.tags || [];
   const current = state?.current;
   const isWorking = busy !== null;
-  const activeProfileName = current?.matchedProfileId
-    ? profiles.find((item) => item.id === current.matchedProfileId)?.name || "已匹配"
-    : "未匹配";
-  const readinessScore =
-    (current?.baseUrl ? 1 : 0) + (current?.hasApiKey ? 1 : 0) + (current?.matchedProfileId ? 1 : 0);
-  const readinessPercent = Math.round((readinessScore / 3) * 100);
   const profilesPerPage = 8;
   const searchValue = profileSearch.trim().toLowerCase();
   const filteredProfiles = profiles.filter((profile) => {
@@ -676,13 +792,44 @@ function App(): ReactElement {
           <button onClick={() => api.revealPath("codexHome")} title="打开 .codex">
             <FolderOpen size={18} />
           </button>
-          <button onClick={() => api.revealPath("storage")} title="打开 profiles.json">
-            <Database size={18} />
+          <button
+            className={activeView === "profile-file" ? "active" : ""}
+            onClick={() => setActiveView("profile-file")}
+            title="查看 profiles.json"
+          >
+            <ClipboardText size={18} weight={activeView === "profile-file" ? "fill" : "regular"} />
           </button>
         </div>
       </aside>
 
       <section className="workspace">
+        {activeView === "profile-file" && (
+          <section className="view-panel profile-file-view">
+            <header className="profile-file-header">
+              <div>
+                <h1>profiles.json</h1>
+                <p>{profileFile?.path || state?.storagePath || "正在读取配置文件"}</p>
+              </div>
+              <div className="profile-file-actions">
+                <span>{profileFile?.updatedAt ? `更新于 ${formatDate(profileFile.updatedAt)}` : "本机配置数据"}</span>
+                <button className="secondary-action" onClick={() => setProfileFileRevision((value) => value + 1)}>
+                  <ArrowClockwise size={17} />
+                  刷新
+                </button>
+              </div>
+            </header>
+            <div className="profile-file-content">
+              {profileFileError ? (
+                <div className="profile-file-error"><WarningCircle size={20} />{profileFileError}</div>
+              ) : profileFile ? (
+                <pre><code>{profileFile.content}</code></pre>
+              ) : (
+                <div className="profile-file-loading">正在读取 profiles.json</div>
+              )}
+            </div>
+          </section>
+        )}
+
         {activeView === "profiles" && (
           <section className="view-panel profiles-view subscriptions-view">
             <section className="subscriptions-panel">
@@ -738,6 +885,16 @@ function App(): ReactElement {
                 </div>
               </div>
 
+              {current && (
+                <div className={`connection-status-banner ${current.connectionKind}`} role="status">
+                  {current.connectionKind === "official" || current.connectionKind === "relay"
+                    ? <ShieldCheck size={18} weight="fill" />
+                    : <WarningCircle size={18} weight="fill" />}
+                  <strong>{current.connectionKind === "official" ? "官方登录" : current.connectionKind === "relay" ? "中转站" : current.connectionKind === "error" ? "配置错误" : "未识别"}</strong>
+                  <span>{current.connectionMessage}</span>
+                </div>
+              )}
+
               <div className="subscription-section-title">
                 <h2>可用配置</h2>
                 {profilePageCount > 1 && (
@@ -772,6 +929,8 @@ function App(): ReactElement {
                       isTesting={testingProfileId === profile.id}
                       isConnectingDashboard={connectingDashboardProfileId === profile.id}
                       onApply={handleApply}
+                      onSaveApiKey={handleSaveProfileApiKey}
+                      onDeleteApiKey={handleDeleteProfileApiKey}
                       onConnectDashboardAuth={handleConnectDashboardAuth}
                       onDelete={handleDelete}
                       onEdit={startEditProfile}
@@ -856,8 +1015,8 @@ function App(): ReactElement {
                       <Shuffle size={18} />
                       {busy === "dynamic-endurance" ? "分配中" : "立即分配"}
                     </button>
-                    <button className="secondary-action" onClick={() => void api.revealPath("storage")} disabled={isWorking}>
-                      <Database size={18} />
+                    <button className="secondary-action" onClick={() => setActiveView("profile-file")} disabled={isWorking}>
+                      <ClipboardText size={18} />
                       配置文件
                     </button>
                   </div>
@@ -939,6 +1098,49 @@ function App(): ReactElement {
             <section className="backups-panel">
               <div className="backups-header">
                 <h1>备份恢复</h1>
+                {backups.length > 0 && (
+                  <div className="backup-toolbar">
+                    {backupSelectionMode ? (
+                      <>
+                        <button
+                          className="secondary-action"
+                          onClick={() => setSelectedBackupIds(selectedBackupIds.length === backups.length ? [] : backups.map((item) => item.id))}
+                          disabled={isWorking}
+                        >
+                          <Checks size={17} />
+                          {selectedBackupIds.length === backups.length ? "取消全选" : "全部选择"}
+                        </button>
+                        <button
+                          className="danger-action"
+                          onClick={() => void handleDeleteBackups(selectedBackupIds, `清理选中的 ${selectedBackupIds.length} 条备份`)}
+                          disabled={isWorking || selectedBackupIds.length === 0}
+                        >
+                          <Trash size={17} />
+                          清理所选
+                        </button>
+                        <button className="secondary-action" onClick={closeBackupSelection} disabled={isWorking}>
+                          <XCircle size={17} />
+                          取消
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button className="secondary-action" onClick={() => setBackupSelectionMode(true)} disabled={isWorking}>
+                          <CheckSquare size={17} />
+                          选择清理
+                        </button>
+                        <button
+                          className="danger-action"
+                          onClick={() => void handleDeleteBackups(backups.map((backup) => backup.id), `清理全部 ${backups.length} 条备份`)}
+                          disabled={isWorking}
+                        >
+                          <Trash size={17} />
+                          全部清理
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
 
               {busy === "loading" ? (
@@ -955,7 +1157,16 @@ function App(): ReactElement {
               ) : (
                 <div className="backup-list">
                   {backups.map((backup) => (
-                    <article className="backup-row" key={backup.id}>
+                    <article className={`backup-row ${backupSelectionMode ? "selecting" : ""}`} key={backup.id}>
+                      {backupSelectionMode && (
+                        <button
+                          className={`backup-select-button ${selectedBackupIds.includes(backup.id) ? "selected" : ""}`}
+                          onClick={() => toggleBackupSelection(backup.id)}
+                          aria-label={selectedBackupIds.includes(backup.id) ? `取消选择 ${backup.profileName}` : `选择 ${backup.profileName}`}
+                        >
+                          {selectedBackupIds.includes(backup.id) ? <CheckSquare size={20} weight="fill" /> : <Square size={20} />}
+                        </button>
+                      )}
                       <span className="backup-row-icon">
                         <Archive size={20} />
                       </span>
@@ -984,6 +1195,31 @@ function App(): ReactElement {
           </section>
         )}
       </section>
+
+      {restartPromptOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setRestartPromptOpen(false)}>
+          <section
+            className="restart-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restart-modal-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <span className="restart-modal-icon"><ArrowClockwise size={22} /></span>
+            <div>
+              <h2 id="restart-modal-title">配置已经保存</h2>
+              <p>安全重启仅作用于 Codex 桌面端。检测到正在运行的任务时会自动取消，不会强制结束进程；IDE 扩展从新任务读取配置。</p>
+            </div>
+            <div className="restart-modal-actions">
+              <button className="secondary-action" onClick={() => setRestartPromptOpen(false)}>稍后生效</button>
+              <button className="primary-action" onClick={() => void handleSafeRestart()}>
+                <ArrowClockwise size={17} />
+                安全重启
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {profileModalMode && (
         <div className="modal-backdrop" role="presentation" onMouseDown={closeProfileModal}>
@@ -1032,6 +1268,19 @@ function App(): ReactElement {
                   <button type="button" className="inline-icon" onClick={() => setShowKey((value) => !value)}>
                     {showKey ? <EyeSlash size={18} /> : <Eye size={18} />}
                   </button>
+                </div>
+              </label>
+
+              <label>
+                <span>API Key 备注</span>
+                <div className="input-shell">
+                  <ClipboardText size={18} />
+                  <input
+                    value={modalForm.apiKeyNotes}
+                    onChange={(event) => updateProfileModalForm({ apiKeyNotes: event.target.value })}
+                    placeholder="例如：低价 / 高并发 / 按量计费"
+                    autoComplete="off"
+                  />
                 </div>
               </label>
 
@@ -1246,6 +1495,8 @@ function SubscriptionCard({
   isTesting,
   isConnectingDashboard,
   onApply,
+  onSaveApiKey,
+  onDeleteApiKey,
   onConnectDashboardAuth,
   onDelete,
   onEdit,
@@ -1257,25 +1508,46 @@ function SubscriptionCard({
   isWorking: boolean;
   isTesting: boolean;
   isConnectingDashboard: boolean;
-  onApply: (profileId: string) => Promise<void>;
+  onApply: (profileId: string, apiKeyId?: string) => Promise<void>;
+  onSaveApiKey: (profileId: string, apiKey: string, notes: string) => Promise<boolean>;
+  onDeleteApiKey: (profileId: string, apiKeyId: string) => Promise<void>;
   onConnectDashboardAuth: (profile: PublicProfile) => Promise<void>;
   onDelete: (profile: PublicProfile) => Promise<void>;
   onEdit: (profile: PublicProfile) => void;
   onOpen: (profile: PublicProfile) => Promise<void>;
   onTest: (profileId: string) => Promise<void>;
 }): ReactElement {
+  const [keyListOpen, setKeyListOpen] = useState(false);
+  const [keyModalOpen, setKeyModalOpen] = useState(false);
+  const [newApiKey, setNewApiKey] = useState("");
+  const [newApiKeyNotes, setNewApiKeyNotes] = useState("");
+  const [showNewApiKey, setShowNewApiKey] = useState(false);
   const isOfficial = profile.builtin || profile.kind === "official";
   const statusTone = profile.isActive ? "active" : profile.testStatus || "idle";
   const statusText = profile.isActive ? "当前使用" : rowStatusLabel(profile);
   const authLabel = isOfficial ? "认证方式" : "API Key";
-  const authValue = isOfficial ? "ChatGPT 登录" : profile.apiKeyPreview;
+  const activeApiKey = profile.apiKeys.find((key) => key.id === profile.activeApiKeyId) || profile.apiKeys[0];
+  const authValue = isOfficial ? "ChatGPT 登录" : activeApiKey?.preview || profile.apiKeyPreview;
   const endpointLabel = isOfficial ? "官方入口" : "Base URL";
   const endpointValue = isOfficial ? "codex login" : profile.normalizedBaseUrl;
   const canConnectDashboard = !isOfficial && profile.dashboardAuth?.supported;
   const dashboardConnected = Boolean(profile.dashboardAuth?.connected);
 
+  async function submitApiKey(event: { preventDefault: () => void }): Promise<void> {
+    event.preventDefault();
+    const saved = await onSaveApiKey(profile.id, newApiKey, newApiKeyNotes);
+    if (saved) {
+      setNewApiKey("");
+      setNewApiKeyNotes("");
+      setShowNewApiKey(false);
+      setKeyModalOpen(false);
+      setKeyListOpen(true);
+    }
+  }
+
   return (
-    <article className={`subscription-card ${statusTone} ${isOfficial ? "builtin" : ""}`}>
+    <>
+    <article className={`subscription-card ${statusTone} ${isOfficial ? "builtin" : ""} ${keyListOpen ? "keys-expanded" : ""}`}>
       <div className="subscription-card-top">
         <ProviderIcon profile={profile} />
         <span>
@@ -1297,11 +1569,54 @@ function SubscriptionCard({
       </div>
 
       <div className="subscription-card-tiles">
-        <div className="subscription-mini-tile">
+        <div className={`subscription-mini-tile ${!isOfficial ? "api-key-tile" : ""}`}>
           {isOfficial ? <ShieldCheck size={17} /> : <Key size={17} />}
           <span>{authLabel}</span>
-          <strong>{authValue}</strong>
+          <strong title={activeApiKey?.notes || authValue}>{authValue}</strong>
+          {!isOfficial && (
+            <span className="api-key-tile-actions">
+              <button type="button" onClick={() => setKeyModalOpen(true)} disabled={isWorking} title="添加 API Key" aria-label="添加 API Key">
+                <LucidePlus size={15} />
+              </button>
+              <button
+                type="button"
+                className={keyListOpen ? "open" : ""}
+                onClick={() => setKeyListOpen((value) => !value)}
+                title={keyListOpen ? "收起 API Key" : "展开 API Key"}
+                aria-label={keyListOpen ? "收起 API Key" : "展开 API Key"}
+                aria-expanded={keyListOpen}
+              >
+                <LucideChevronDown size={15} />
+              </button>
+            </span>
+          )}
         </div>
+        {!isOfficial && keyListOpen && (
+          <div className="api-key-list">
+            {profile.apiKeys.map((apiKey) => (
+              <div className={`api-key-option ${apiKey.isActive ? "active" : ""}`} key={apiKey.id}>
+                <button type="button" className="api-key-apply" onClick={() => void onApply(profile.id, apiKey.id)} disabled={isWorking}>
+                  <span className="api-key-radio">{apiKey.isActive ? <LucideCheck size={12} strokeWidth={2.5} /> : null}</span>
+                  <span className="api-key-copy">
+                    <strong>{apiKey.preview}</strong>
+                    <small>{apiKey.notes || "未添加备注"}</small>
+                  </span>
+                  <em>{apiKey.isActive ? "当前配置" : "应用配置"}</em>
+                </button>
+                <button
+                  type="button"
+                  className="api-key-delete"
+                  onClick={() => void onDeleteApiKey(profile.id, apiKey.id)}
+                  disabled={isWorking || profile.apiKeys.length <= 1}
+                  title={profile.apiKeys.length <= 1 ? "至少保留一个 API Key" : "删除 API Key"}
+                  aria-label="删除 API Key"
+                >
+                  <LucideTrash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className={`subscription-mini-tile tinted ${statusTone}`}>
           <ShieldCheck size={17} />
           <span>状态</span>
@@ -1378,6 +1693,45 @@ function SubscriptionCard({
         )}
       </div>
     </article>
+    {keyModalOpen && (
+      <div className="modal-backdrop" role="presentation" onMouseDown={() => setKeyModalOpen(false)}>
+        <section className="relay-modal api-key-modal" role="dialog" aria-modal="true" aria-labelledby={`api-key-modal-${profile.id}`} onMouseDown={(event) => event.stopPropagation()}>
+          <div className="relay-modal-head">
+            <div>
+              <span>API key</span>
+              <h2 id={`api-key-modal-${profile.id}`}>为 {profile.name} 添加 Key</h2>
+            </div>
+          </div>
+          <form className="relay-modal-form" onSubmit={(event) => void submitApiKey(event)}>
+            <label>
+              <span>API Key</span>
+              <div className="input-shell">
+                <Key size={18} />
+                <input value={newApiKey} onChange={(event) => setNewApiKey(event.target.value)} placeholder="sk-..." type={showNewApiKey ? "text" : "password"} autoComplete="off" autoFocus />
+                <button type="button" className="inline-icon" onClick={() => setShowNewApiKey((value) => !value)} title={showNewApiKey ? "隐藏 API Key" : "显示 API Key"}>
+                  {showNewApiKey ? <LucideEyeOff size={17} /> : <LucideEye size={17} />}
+                </button>
+              </div>
+            </label>
+            <label>
+              <span>备注</span>
+              <div className="input-shell">
+                <ClipboardText size={18} />
+                <input value={newApiKeyNotes} onChange={(event) => setNewApiKeyNotes(event.target.value)} placeholder="例如：低价 / 高并发 / 按量计费" autoComplete="off" />
+              </div>
+            </label>
+            <div className="relay-modal-actions">
+              <button type="button" className="secondary-action" onClick={() => setKeyModalOpen(false)} disabled={isWorking}>取消</button>
+              <button type="submit" className="primary-action" disabled={isWorking || !newApiKey.trim()}>
+                <LucideCheck size={17} strokeWidth={2.25} />
+                添加
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    )}
+    </>
   );
 }
 
