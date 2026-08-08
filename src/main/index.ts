@@ -16,12 +16,22 @@ import type {
   OperationResult,
   ProviderDetection,
   ProfileUsageSummary,
+  ProfileFileSnapshot,
   ProfileTag,
   PublicProfile,
+  SaveProfileApiKeyInput,
   SaveProfileInput,
   TestProfileInput,
   UpdateDynamicEnduranceInput
 } from "../shared/types";
+import { classifyCodexConnection } from "./codex-state";
+import { installBrokenPipeGuards, isBrokenPipeError, writeStreamSafely } from "./stdio";
+
+// Codex Switch renders a simple 2D UI and never plays audio. Disabling these
+// native paths avoids Electron crashes caused by injected GPU/audio overlays
+// (notably Nahimic/A-Volute on Windows).
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch("disable-audio-output");
 
 type SecretStorage = "safeStorage" | "base64";
 
@@ -41,6 +51,12 @@ interface StoredDashboardAuth {
   lastBalanceEndpoint?: string;
 }
 
+interface StoredOfficialUsageAuth {
+  payload: StoredEncryptedSecret;
+  updatedAt: string;
+  expiresAt?: string;
+}
+
 interface StoredProfile {
   id: string;
   name: string;
@@ -55,6 +71,8 @@ interface StoredProfile {
   apiKeyStorage: SecretStorage;
   apiKeyHash: string;
   apiKeyPreview: string;
+  apiKeys?: StoredApiKey[];
+  activeApiKeyId?: string;
   createdAt: string;
   updatedAt: string;
   lastAppliedAt?: string;
@@ -67,6 +85,17 @@ interface StoredProfile {
   dashboardAuth?: StoredDashboardAuth;
 }
 
+interface StoredApiKey {
+  id: string;
+  cipher: string;
+  storage: SecretStorage;
+  hash: string;
+  preview: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface StoreFile {
   schemaVersion: number;
   profiles: StoredProfile[];
@@ -75,6 +104,7 @@ interface StoreFile {
     authKeyName: string;
     providerName: string;
     officialUsage?: ProfileUsageSummary;
+    officialUsageAuth?: StoredOfficialUsageAuth;
     dynamicEndurance?: DynamicEnduranceSettings;
     localUpdate?: LocalUpdatePreference;
   };
@@ -153,11 +183,14 @@ interface CodexProcessSummary {
   message?: string;
 }
 
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const AUTH_API_KEY_FIELD = "OPENAI_API_KEY";
 const API_KEY_AUTH_MODE = "apikey";
 const CHATGPT_AUTH_MODE = "chatgpt";
 const DEFAULT_PROVIDER_NAME = "OpenAI";
+const SWITCH_PROVIDER_ID = "codex_switch";
+const AUTH_CREDENTIALS_STORE_FIELD = "cli_auth_credentials_store";
+const FORCED_LOGIN_METHOD_FIELD = "forced_login_method";
 const APP_USER_MODEL_ID = "dev.codex-switch.app";
 const OFFICIAL_PROFILE_ID = "official-codex-chatgpt";
 const DEFAULT_DYNAMIC_ENDURANCE_SETTINGS: DynamicEnduranceSettings = {
@@ -173,6 +206,7 @@ const BALANCE_RETRY_DELAY_MS = 420;
 const LOCAL_UPDATE_INITIAL_CHECK_MS = 8000;
 const LOCAL_UPDATE_CHECK_INTERVAL_MS = 60000;
 const LOCAL_UPDATE_RESULT_FILE = "update-result.json";
+const LOCAL_UPDATE_PENDING_TIMEOUT_MS = 15 * 60 * 1000;
 const DYNAMIC_ACTIVITY_DEBOUNCE_MS = 6500;
 const CODEX_RESTART_DEBOUNCE_MS = 450;
 const USAGE_SYNC_INTERVAL_FRIENDLY_NAME = "额度同步";
@@ -193,6 +227,7 @@ let restartTimer: ReturnType<typeof setTimeout> | undefined;
 let restartBeforeSignature = "";
 let restartAfterSignature = "";
 let restartWaiters: Array<(result: CodexRestartResult) => void> = [];
+let dashboardProbeQueue: Promise<void> = Promise.resolve();
 
 function abortActiveTestRequests(): void {
   for (const timeout of activeTestTimeouts) {
@@ -296,6 +331,10 @@ function createWindow(): void {
     mainWindow = null;
   });
 
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    void appendDiagnosticLog("render-process-gone", details);
+  });
+
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
@@ -335,6 +374,15 @@ async function writeTextAtomic(filePath: string, content: string): Promise<void>
   const tempPath = `${filePath}.${process.pid}.tmp`;
   await fs.writeFile(tempPath, content, "utf8");
   await fs.rename(tempPath, filePath);
+}
+
+async function appendDiagnosticLog(event: string, details: unknown): Promise<void> {
+  try {
+    const logPath = join(app.getPath("userData"), "diagnostics.log");
+    await fs.appendFile(logPath, `${JSON.stringify({ timestamp: nowIso(), event, details })}\n`, "utf8");
+  } catch {
+    // Diagnostics must never destabilize the app.
+  }
 }
 
 function nowIso(): string {
@@ -388,11 +436,105 @@ function decryptSecretValue(secret: StoredEncryptedSecret): string {
   return Buffer.from(secret.cipher, "base64").toString("utf8");
 }
 
+function readJwtExpiresAt(accessToken: string): string | undefined {
+  try {
+    const payload = accessToken.split(".")[1];
+    if (!payload) {
+      return undefined;
+    }
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as unknown;
+    const expiresAt = isRecord(parsed) ? numberFromUnknown(parsed.exp) : undefined;
+    return expiresAt === undefined ? undefined : new Date(expiresAt * 1000).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+function cacheOfficialUsageAuth(store: StoreFile, auth: CodexAuthFile): void {
+  const tokens = readChatGptTokens(auth);
+  if (!tokens.access_token) {
+    return;
+  }
+  store.preferences.officialUsageAuth = {
+    // Deliberately cache only the short-lived access token. A refresh token must
+    // remain owned by Codex and must never be replayed into auth.json by Switch.
+    payload: encryptSecretValue(JSON.stringify(tokens)),
+    updatedAt: nowIso(),
+    expiresAt: readJwtExpiresAt(tokens.access_token)
+  };
+}
+
+function readCachedOfficialUsageTokens(store: StoreFile): ChatGptTokens {
+  const cached = store.preferences.officialUsageAuth;
+  if (!cached) {
+    return {};
+  }
+  if (cached.expiresAt && Date.parse(cached.expiresAt) <= Date.now() + 30_000) {
+    delete store.preferences.officialUsageAuth;
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(decryptSecretValue(cached.payload)) as unknown;
+    return isRecord(parsed) ? readChatGptTokens({ tokens: parsed }) : {};
+  } catch {
+    delete store.preferences.officialUsageAuth;
+    return {};
+  }
+}
+
 function decryptSecret(profile: StoredProfile): string {
+  const activeKey = getActiveStoredApiKey(profile);
+  if (activeKey) {
+    return decryptSecretValue({ cipher: activeKey.cipher, storage: activeKey.storage });
+  }
   return decryptSecretValue({
     cipher: profile.apiKeyCipher,
     storage: profile.apiKeyStorage
   });
+}
+
+function normalizeStoredApiKeys(profile: StoredProfile): StoredApiKey[] {
+  const keys = Array.isArray(profile.apiKeys)
+    ? profile.apiKeys.filter((key) => key && key.id && key.cipher && key.hash)
+    : [];
+  if (keys.length > 0) {
+    return keys;
+  }
+  if (!profile.apiKeyCipher || !profile.apiKeyHash) {
+    return [];
+  }
+  return [{
+    id: profile.activeApiKeyId || randomId(),
+    cipher: profile.apiKeyCipher,
+    storage: profile.apiKeyStorage,
+    hash: profile.apiKeyHash,
+    preview: profile.apiKeyPreview,
+    notes: profile.notes,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt
+  }];
+}
+
+function getActiveStoredApiKey(profile: StoredProfile, apiKeyId?: string): StoredApiKey | undefined {
+  const keys = normalizeStoredApiKeys(profile);
+  return keys.find((key) => key.id === (apiKeyId || profile.activeApiKeyId)) || keys[0];
+}
+
+function withActiveApiKey(profile: StoredProfile, apiKeyId?: string): StoredProfile {
+  const apiKeys = normalizeStoredApiKeys(profile);
+  const active = apiKeys.find((key) => key.id === apiKeyId) || getActiveStoredApiKey({ ...profile, apiKeys });
+  if (!active) {
+    return { ...profile, apiKeys };
+  }
+  return {
+    ...profile,
+    apiKeys,
+    activeApiKeyId: active.id,
+    apiKeyCipher: active.cipher,
+    apiKeyStorage: active.storage,
+    apiKeyHash: active.hash,
+    apiKeyPreview: active.preview
+  };
 }
 
 function normalizeBaseUrl(input: string): string {
@@ -529,16 +671,17 @@ async function readStore(): Promise<StoreFile> {
   return {
     schemaVersion: STORE_VERSION,
     profiles: Array.isArray(parsed.profiles)
-      ? parsed.profiles.map((profile) => ({
+      ? parsed.profiles.map((profile) => withActiveApiKey({
           ...profile,
           tagIds: normalizeTagIds((profile as Partial<StoredProfile>).tagIds, tagIds)
-        }))
+        } as StoredProfile))
       : [],
     tags,
     preferences: {
       authKeyName: parsed.preferences?.authKeyName || AUTH_API_KEY_FIELD,
       providerName: parsed.preferences?.providerName || DEFAULT_PROVIDER_NAME,
       officialUsage: parsed.preferences?.officialUsage,
+      officialUsageAuth: parsed.preferences?.officialUsageAuth,
       dynamicEndurance: normalizeDynamicEnduranceSettings(parsed.preferences?.dynamicEndurance),
       localUpdate: parsed.preferences?.localUpdate
     }
@@ -548,6 +691,28 @@ async function readStore(): Promise<StoreFile> {
 async function writeStore(store: StoreFile): Promise<void> {
   const { storagePath } = paths();
   await writeTextAtomic(storagePath, `${JSON.stringify(store, null, 2)}\n`);
+}
+
+async function migrateLegacyOfficialAuth(): Promise<void> {
+  const store = await readStore();
+  const { authPath } = paths();
+  const authContent = await readTextIfExists(authPath);
+  const auth = parseCodexAuthFileOrEmpty(authContent);
+
+  // Versions up to 1.0.8 kept ChatGPT refresh credentials beside an API-key
+  // login. Shared Codex clients could then try to refresh a revoked account.
+  // Preserve only a short-lived access token for read-only usage display.
+  if (readApiKeyAuth(auth).authMode === API_KEY_AUTH_MODE && isRecord(auth.tokens)) {
+    cacheOfficialUsageAuth(store, auth);
+    const nextAuth = { ...auth };
+    delete nextAuth.tokens;
+    delete nextAuth.last_refresh;
+    await writeTextAtomic(authPath, stringifyAuthFile(nextAuth));
+  }
+
+  // readStore intentionally does not carry forward the legacy officialAuth
+  // field, so this write permanently removes stored refresh-token snapshots.
+  await writeStore(store);
 }
 
 function isYunduProfile(profile: Pick<StoredProfile, "baseUrl" | "host" | "origin">): boolean {
@@ -568,12 +733,18 @@ function dashboardAuthStatus(profile: StoredProfile): PublicProfile["dashboardAu
   };
 }
 
-function toPublicProfile(profile: StoredProfile, currentBaseUrl?: string, currentApiHash?: string): PublicProfile {
+function toPublicProfile(
+  profile: StoredProfile,
+  currentBaseUrl?: string,
+  currentApiHash?: string,
+  usesSwitchTokenCommand = false
+): PublicProfile {
+  const apiKeys = normalizeStoredApiKeys(profile);
+  const activeApiKey = getActiveStoredApiKey({ ...profile, apiKeys });
   const isActive = Boolean(
     currentBaseUrl &&
-      currentApiHash &&
       normalizeComparableUrl(profile.baseUrl) === normalizeComparableUrl(currentBaseUrl) &&
-      profile.apiKeyHash === currentApiHash
+      (usesSwitchTokenCommand || (currentApiHash && profile.apiKeyHash === currentApiHash))
   );
 
   return {
@@ -591,6 +762,16 @@ function toPublicProfile(profile: StoredProfile, currentBaseUrl?: string, curren
     known: profile.known,
     apiKeyPreview: profile.apiKeyPreview,
     apiKeyHash: profile.apiKeyHash,
+    apiKeys: apiKeys.map((key) => ({
+      id: key.id,
+      preview: key.preview,
+      hash: key.hash,
+      notes: key.notes,
+      createdAt: key.createdAt,
+      updatedAt: key.updatedAt,
+      isActive: key.id === activeApiKey?.id
+    })),
+    activeApiKeyId: activeApiKey?.id || "",
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
     lastAppliedAt: profile.lastAppliedAt,
@@ -605,9 +786,9 @@ function toPublicProfile(profile: StoredProfile, currentBaseUrl?: string, curren
   };
 }
 
-function createOfficialProfile(current: { baseUrl?: string; hasApiKey: boolean }, usage?: ProfileUsageSummary): PublicProfile {
+function createOfficialProfile(current: { baseUrl?: string; hasApiKey: boolean; connectionKind?: AppState["current"]["connectionKind"] }, usage?: ProfileUsageSummary): PublicProfile {
   const now = nowIso();
-  const isActive = !current.baseUrl && !current.hasApiKey;
+  const isActive = current.connectionKind === "official";
 
   return {
     id: OFFICIAL_PROFILE_ID,
@@ -624,6 +805,8 @@ function createOfficialProfile(current: { baseUrl?: string; hasApiKey: boolean }
     known: true,
     apiKeyPreview: "ChatGPT 登录",
     apiKeyHash: "",
+    apiKeys: [],
+    activeApiKeyId: "",
     createdAt: now,
     updatedAt: now,
     tagIds: [],
@@ -693,20 +876,26 @@ function upsertApiKeyAuth(content: string, apiKey: string): string {
   }
 
   const auth = parseCodexAuthFile(content);
-  return stringifyAuthFile({
+  const nextAuth: CodexAuthFile = {
     ...auth,
     auth_mode: API_KEY_AUTH_MODE,
     [AUTH_API_KEY_FIELD]: trimmed
-  });
+  };
+  delete nextAuth.tokens;
+  delete nextAuth.last_refresh;
+  return stringifyAuthFile(nextAuth);
 }
 
 function switchToChatGptAuth(content: string): string {
   const auth = parseCodexAuthFileOrEmpty(content);
-  return stringifyAuthFile({
+  const nextAuth: CodexAuthFile = {
     ...auth,
     auth_mode: CHATGPT_AUTH_MODE,
     [AUTH_API_KEY_FIELD]: null
-  });
+  };
+  delete nextAuth.tokens;
+  delete nextAuth.last_refresh;
+  return stringifyAuthFile(nextAuth);
 }
 
 function escapeTomlString(value: string): string {
@@ -737,6 +926,36 @@ function readModelProvider(content: string): string | undefined {
   return match?.[1];
 }
 
+function readTopLevelTomlString(content: string, key: string): string | undefined {
+  const firstSection = /^\s*\[/m.exec(content);
+  const topLevel = firstSection ? content.slice(0, firstSection.index) : content;
+  const match = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*["']([^"']+)["']\\s*(?:#.*)?$`, "m").exec(topLevel);
+  return match?.[1];
+}
+
+function upsertTopLevelTomlString(content: string, key: string, value: string): string {
+  const newline = content.includes("\r\n") ? "\r\n" : "\n";
+  const firstSection = /^\s*\[/m.exec(content);
+  const topLevelEnd = firstSection?.index ?? content.length;
+  const topLevel = content.slice(0, topLevelEnd);
+  const keyRegex = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`, "m");
+  if (keyRegex.test(topLevel)) {
+    return `${topLevel.replace(keyRegex, `${key} = "${escapeTomlString(value)}"`)}${content.slice(topLevelEnd)}`;
+  }
+  return `${key} = "${escapeTomlString(value)}"${newline}${content}`;
+}
+
+function assertLoginMethodAllowed(content: string, target: "api" | "chatgpt"): void {
+  const forced = readTopLevelTomlString(content, FORCED_LOGIN_METHOD_FIELD);
+  if (forced && forced !== target) {
+    throw new Error(
+      `Codex 配置强制使用 ${forced === "chatgpt" ? "ChatGPT" : "API Key"} 登录，无法切换到${
+        target === "chatgpt" ? "官方 ChatGPT" : "中转 API Key"
+      }模式`
+    );
+  }
+}
+
 function readBaseUrlFromConfig(content: string, providerName = DEFAULT_PROVIDER_NAME): string | undefined {
   const section = findTomlSection(content, `model_providers.${providerName}`);
   if (!section) {
@@ -746,46 +965,23 @@ function readBaseUrlFromConfig(content: string, providerName = DEFAULT_PROVIDER_
   return match?.[1];
 }
 
-function upsertCodexConfig(content: string, baseUrl: string): string {
+function upsertCodexConfig(content: string, baseUrl: string, profileId: string, tokenCommandPath: string): string {
   const newline = content.includes("\r\n") ? "\r\n" : "\n";
   const escapedBaseUrl = escapeTomlString(baseUrl);
+  const escapedProfileId = escapeTomlString(profileId);
+  const escapedTokenCommandPath = escapeTomlString(tokenCommandPath);
   let next = content.trim() ? content : "";
-  next = removeTomlNamespace(next, `model_providers.${DEFAULT_PROVIDER_NAME}.auth`);
+  next = removeTomlNamespace(next, `model_providers.${SWITCH_PROVIDER_ID}`);
+  next = upsertTopLevelTomlString(next, AUTH_CREDENTIALS_STORE_FIELD, "file");
 
   if (/^model_provider\s*=.*$/m.test(next)) {
-    next = next.replace(/^model_provider\s*=.*$/m, `model_provider = "${DEFAULT_PROVIDER_NAME}"`);
+    next = next.replace(/^model_provider\s*=.*$/m, `model_provider = "${SWITCH_PROVIDER_ID}"`);
   } else {
-    next = `model_provider = "${DEFAULT_PROVIDER_NAME}"${newline}${next}`;
+    next = `model_provider = "${SWITCH_PROVIDER_ID}"${newline}${next}`;
   }
 
-  const section = findTomlSection(next, `model_providers.${DEFAULT_PROVIDER_NAME}`);
-  if (!section) {
-    const suffix = next.endsWith(newline) || !next ? "" : newline;
-    return `${next}${suffix}${newline}[model_providers.${DEFAULT_PROVIDER_NAME}]${newline}name = "${DEFAULT_PROVIDER_NAME}"${newline}base_url = "${escapedBaseUrl}"${newline}wire_api = "responses"${newline}requires_openai_auth = true${newline}`;
-  }
-
-  let body = section.body;
-  if (/^\s*base_url\s*=.*$/m.test(body)) {
-    body = body.replace(/^\s*base_url\s*=.*$/m, `base_url = "${escapedBaseUrl}"`);
-  } else if (/^\s*name\s*=.*$/m.test(body)) {
-    body = body.replace(/^(\s*name\s*=.*(?:\r?\n)?)/m, `$1base_url = "${escapedBaseUrl}"${newline}`);
-  } else {
-    body = `${newline}name = "${DEFAULT_PROVIDER_NAME}"${newline}base_url = "${escapedBaseUrl}"${body}`;
-  }
-
-  body = body.replace(/^\s*env_key\s*=.*(?:\r?\n)?/gm, "");
-
-  if (!/^\s*wire_api\s*=.*$/m.test(body)) {
-    body = body.replace(/^(\s*base_url\s*=.*(?:\r?\n)?)/m, `$1wire_api = "responses"${newline}`);
-  }
-
-  if (/^\s*requires_openai_auth\s*=.*$/m.test(body)) {
-    body = body.replace(/^\s*requires_openai_auth\s*=.*$/m, "requires_openai_auth = true");
-  } else {
-    body = body.replace(/^(\s*wire_api\s*=.*(?:\r?\n)?)/m, `$1requires_openai_auth = true${newline}`);
-  }
-
-  return `${next.slice(0, section.headerEnd)}${body}${next.slice(section.bodyEnd)}`;
+  const suffix = next.endsWith(newline) || !next ? "" : newline;
+  return `${next}${suffix}${newline}[model_providers.${SWITCH_PROVIDER_ID}]${newline}name = "Codex Switch"${newline}base_url = "${escapedBaseUrl}"${newline}wire_api = "responses"${newline}${newline}[model_providers.${SWITCH_PROVIDER_ID}.auth]${newline}command = "${escapedTokenCommandPath}"${newline}args = ["--print-provider-token", "${escapedProfileId}"]${newline}refresh_interval_ms = 0${newline}timeout_ms = 5000${newline}`;
 }
 
 function removeTomlSection(content: string, header: string): string {
@@ -834,7 +1030,10 @@ function compactConfigWhitespace(content: string, newline: string): string {
 function switchToOfficialCodexConfig(content: string): string {
   const newline = content.includes("\r\n") ? "\r\n" : "\n";
   let next = content.replace(/^\s*model_provider\s*=.*(?:\r?\n)?/m, "");
+  next = removeTomlNamespace(next, `model_providers.${SWITCH_PROVIDER_ID}`);
+  // Remove configurations written by Codex Switch 1.0.x, but leave unrelated custom providers intact.
   next = removeTomlNamespace(next, `model_providers.${DEFAULT_PROVIDER_NAME}`);
+  next = upsertTopLevelTomlString(next, AUTH_CREDENTIALS_STORE_FIELD, "file");
   next = removeEmptyTomlSection(next, "model_providers");
   return compactConfigWhitespace(next, newline);
 }
@@ -974,6 +1173,29 @@ async function restoreBackup(backupId: string): Promise<OperationResult> {
   }
 }
 
+async function deleteBackups(backupIds: string[]): Promise<OperationResult> {
+  try {
+    const requestedIds = new Set(backupIds.filter((id) => typeof id === "string" && id.trim()));
+    if (!requestedIds.size) {
+      throw new Error("请先选择要清理的备份");
+    }
+    const backups = await listBackups();
+    const matched = backups.filter((backup) => requestedIds.has(backup.id));
+    if (matched.length !== requestedIds.size) {
+      throw new Error("部分备份不存在或已经被删除");
+    }
+    const { backupRoot } = paths();
+    await Promise.all(matched.map((backup) => fs.rm(join(backupRoot, backup.id), { recursive: true, force: true })));
+    return {
+      ok: true,
+      message: `已清理 ${matched.length} 条备份`,
+      state: await getState()
+    };
+  } catch (error) {
+    return { ok: false, message: normalizeError(error), state: await getState().catch(() => undefined) };
+  }
+}
+
 async function copyIfExists(source: string, target: string): Promise<void> {
   try {
     await fs.copyFile(source, target);
@@ -993,10 +1215,18 @@ async function readCurrentConfig(): Promise<{
   apiKeyHash?: string;
   hasApiKey: boolean;
   apiKeyPreview?: string;
+  hasChatGptToken: boolean;
+  authError?: string;
 }> {
   const { authPath, configPath } = paths();
   const [authContent, configContent] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
-  const auth = parseCodexAuthFileOrEmpty(authContent);
+  let auth: CodexAuthFile = {};
+  let authError: string | undefined;
+  try {
+    auth = parseCodexAuthFile(authContent);
+  } catch (error) {
+    authError = normalizeError(error);
+  }
   const api = readApiKeyAuth(auth);
   const providerName = readModelProvider(configContent) || DEFAULT_PROVIDER_NAME;
   const baseUrl = readBaseUrlFromConfig(configContent, providerName) || readBaseUrlFromConfig(configContent);
@@ -1010,16 +1240,21 @@ async function readCurrentConfig(): Promise<{
     apiKey: api.value,
     apiKeyHash,
     hasApiKey: Boolean(api.value),
-    apiKeyPreview: api.value ? previewSecret(api.value) : undefined
+    apiKeyPreview: api.value ? previewSecret(api.value) : undefined,
+    hasChatGptToken: Boolean(readChatGptTokens(auth).access_token),
+    authError
   };
 }
 
 async function getState(): Promise<AppState> {
   const store = await readStore();
   const current = await readCurrentConfig();
+  const connection = classifyCodexConnection(current);
   const location = paths();
-  const customProfiles = store.profiles.map((profile) => toPublicProfile(profile, current.baseUrl, current.apiKeyHash));
-  const profiles = [createOfficialProfile(current, store.preferences.officialUsage), ...customProfiles];
+  const customProfiles = store.profiles.map((profile) =>
+    toPublicProfile(profile, current.baseUrl, current.apiKeyHash, current.providerName === SWITCH_PROVIDER_ID)
+  );
+  const profiles = [createOfficialProfile({ ...current, connectionKind: connection.kind }, store.preferences.officialUsage), ...customProfiles];
   const matched = profiles.find((profile) => profile.isActive);
 
   return {
@@ -1035,7 +1270,9 @@ async function getState(): Promise<AppState> {
       authKeyName: current.authKeyName,
       hasApiKey: current.hasApiKey,
       apiKeyPreview: current.apiKeyPreview,
-      matchedProfileId: matched?.id
+      matchedProfileId: matched?.id,
+      connectionKind: connection.kind,
+      connectionMessage: connection.message
     },
     dynamicEndurance: normalizeDynamicEnduranceSettings(store.preferences.dynamicEndurance),
     storagePath: location.storagePath,
@@ -1059,7 +1296,33 @@ function createOrUpdateStoredProfile(input: SaveProfileInput, existing?: StoredP
     throw new Error("API Key 无法保存");
   }
 
-  return {
+  const existingKeys = existing ? normalizeStoredApiKeys(existing) : [];
+  const currentKey = existing ? getActiveStoredApiKey(existing) : undefined;
+  const nextKey: StoredApiKey | undefined = apiKey && encrypted && hash && preview
+    ? {
+        id: currentKey?.id || randomId(),
+        cipher: encrypted.cipher,
+        storage: encrypted.storage,
+        hash,
+        preview,
+        notes: input.apiKeyNotes?.trim() || currentKey?.notes,
+        createdAt: currentKey?.createdAt || timestamp,
+        updatedAt: timestamp
+      }
+    : currentKey
+      ? {
+          ...currentKey,
+          notes: input.apiKeyNotes !== undefined ? input.apiKeyNotes.trim() || undefined : currentKey.notes,
+          updatedAt: input.apiKeyNotes !== undefined ? timestamp : currentKey.updatedAt
+        }
+      : undefined;
+  const apiKeys = nextKey
+    ? existingKeys.some((key) => key.id === nextKey.id)
+      ? existingKeys.map((key) => key.id === nextKey.id ? nextKey : key)
+      : [nextKey, ...existingKeys]
+    : existingKeys;
+
+  return withActiveApiKey({
     id: existing?.id || input.id || randomId(),
     name: input.name?.trim() || existing?.name || detection.name,
     baseUrl: detection.normalizedBaseUrl,
@@ -1073,6 +1336,8 @@ function createOrUpdateStoredProfile(input: SaveProfileInput, existing?: StoredP
     apiKeyStorage: encrypted?.storage || existing?.apiKeyStorage || "base64",
     apiKeyHash: hash,
     apiKeyPreview: preview,
+    apiKeys,
+    activeApiKeyId: nextKey?.id || existing?.activeApiKeyId,
     createdAt: existing?.createdAt || timestamp,
     updatedAt: timestamp,
     lastAppliedAt: existing?.lastAppliedAt,
@@ -1083,7 +1348,7 @@ function createOrUpdateStoredProfile(input: SaveProfileInput, existing?: StoredP
     lastTestMessage: existing?.lastTestMessage,
     usage: existing?.usage,
     dashboardAuth: existing?.dashboardAuth
-  };
+  });
 }
 
 function normalizeError(error: unknown): string {
@@ -1117,20 +1382,94 @@ async function saveProfile(input: SaveProfileInput): Promise<OperationResult> {
   }
 }
 
-async function applyProfile(profileId: string): Promise<OperationResult> {
+async function saveProfileApiKey(input: SaveProfileApiKeyInput): Promise<OperationResult> {
+  try {
+    const apiKey = input.apiKey.trim();
+    if (!apiKey) {
+      throw new Error("请输入 API Key");
+    }
+    const store = await readStore();
+    const profile = store.profiles.find((item) => item.id === input.profileId);
+    if (!profile) {
+      throw new Error("找不到这个配置");
+    }
+    const hash = hashSecret(apiKey);
+    if (normalizeStoredApiKeys(profile).some((key) => key.hash === hash)) {
+      throw new Error("这个 API Key 已经添加过了");
+    }
+    const encrypted = encryptSecret(apiKey);
+    const timestamp = nowIso();
+    const key: StoredApiKey = {
+      id: randomId(),
+      cipher: encrypted.cipher,
+      storage: encrypted.storage,
+      hash,
+      preview: previewSecret(apiKey),
+      notes: input.notes?.trim() || undefined,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    const nextProfile = withActiveApiKey({
+      ...profile,
+      apiKeys: [...normalizeStoredApiKeys(profile), key],
+      updatedAt: timestamp
+    });
+    store.profiles = store.profiles.map((item) => item.id === profile.id ? nextProfile : item);
+    await writeStore(store);
+    return { ok: true, message: "API Key 已添加", profile: toPublicProfile(nextProfile), state: await getState() };
+  } catch (error) {
+    return { ok: false, message: normalizeError(error) };
+  }
+}
+
+async function deleteProfileApiKey(profileId: string, apiKeyId: string): Promise<OperationResult> {
+  try {
+    const store = await readStore();
+    const profile = store.profiles.find((item) => item.id === profileId);
+    if (!profile) {
+      throw new Error("找不到这个配置");
+    }
+    const apiKeys = normalizeStoredApiKeys(profile);
+    if (apiKeys.length <= 1) {
+      throw new Error("每个中转站至少需要保留一个 API Key");
+    }
+    if (!apiKeys.some((key) => key.id === apiKeyId)) {
+      throw new Error("找不到这个 API Key");
+    }
+    const timestamp = nowIso();
+    const remaining = apiKeys.filter((key) => key.id !== apiKeyId);
+    const nextProfile = withActiveApiKey({
+      ...profile,
+      apiKeys: remaining,
+      activeApiKeyId: profile.activeApiKeyId === apiKeyId ? remaining[0].id : profile.activeApiKeyId,
+      updatedAt: timestamp
+    });
+    store.profiles = store.profiles.map((item) => item.id === profile.id ? nextProfile : item);
+    await writeStore(store);
+    return { ok: true, message: "API Key 已删除", profile: toPublicProfile(nextProfile), state: await getState() };
+  } catch (error) {
+    return { ok: false, message: normalizeError(error) };
+  }
+}
+
+async function applyProfile(profileId: string, apiKeyId?: string): Promise<OperationResult> {
   try {
     if (profileId === OFFICIAL_PROFILE_ID) {
       return await applyOfficialProfile();
     }
 
     const store = await readStore();
-    const profile = store.profiles.find((item) => item.id === profileId);
+    const storedProfile = store.profiles.find((item) => item.id === profileId);
+    const profile = storedProfile ? withActiveApiKey(storedProfile, apiKeyId) : undefined;
     if (!profile) {
       throw new Error("找不到这个配置");
     }
 
-    const apiKey = decryptSecret(profile);
-    if (!apiKey) {
+    if (apiKeyId && profile.activeApiKeyId !== apiKeyId) {
+      throw new Error("找不到这个 API Key");
+    }
+
+    if (!decryptSecret(profile)) {
       throw new Error("这个配置没有可用 API Key");
     }
 
@@ -1139,16 +1478,22 @@ async function applyProfile(profileId: string): Promise<OperationResult> {
     await ensureDir(codexHome);
 
     const [authContent, configContent] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
+    assertLoginMethodAllowed(configContent, "api");
+    cacheOfficialUsageAuth(store, parseCodexAuthFileOrEmpty(authContent));
     const beforeSignature = configSignature(authContent, configContent);
-    const nextAuthContent = upsertApiKeyAuth(authContent, apiKey);
-    const nextConfigContent = upsertCodexConfig(configContent, profile.baseUrl);
-    await writeTextAtomic(authPath, nextAuthContent);
+    const forcedLoginMethod = readTopLevelTomlString(configContent, FORCED_LOGIN_METHOD_FIELD);
+    const nextAuthContent =
+      forcedLoginMethod === "api" ? upsertApiKeyAuth(authContent, decryptSecret(profile)) : authContent;
+    const nextConfigContent = upsertCodexConfig(configContent, profile.baseUrl, profile.id, process.execPath);
+    if (nextAuthContent !== authContent) {
+      await writeTextAtomic(authPath, nextAuthContent);
+    }
     await writeTextAtomic(configPath, nextConfigContent);
     const restart = await restartCodexForConfigChange(beforeSignature, configSignature(nextAuthContent, nextConfigContent));
 
     const timestamp = nowIso();
     store.profiles = store.profiles.map((item) =>
-      item.id === profileId ? { ...item, lastAppliedAt: timestamp, updatedAt: timestamp } : item
+      item.id === profileId ? { ...profile, lastAppliedAt: timestamp, updatedAt: timestamp } : item
     );
     await writeStore(store);
 
@@ -1166,6 +1511,7 @@ async function applyProfile(profileId: string): Promise<OperationResult> {
 
 async function applyOfficialProfile(): Promise<OperationResult> {
   try {
+    const store = await readStore();
     const backupDir = await createBackup({
       id: OFFICIAL_PROFILE_ID,
       name: "官方 Codex",
@@ -1175,25 +1521,32 @@ async function applyOfficialProfile(): Promise<OperationResult> {
     await ensureDir(codexHome);
 
     const [authContent, configContent] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
+    assertLoginMethodAllowed(configContent, "chatgpt");
+    const auth = parseCodexAuthFileOrEmpty(authContent);
+    cacheOfficialUsageAuth(store, auth);
+    const hasReusableLogin = auth.auth_mode === CHATGPT_AUTH_MODE && Boolean(readChatGptTokens(auth).access_token);
     const beforeSignature = configSignature(authContent, configContent);
-    const nextAuthContent = switchToChatGptAuth(authContent);
+    const nextAuthContent = hasReusableLogin ? authContent : switchToChatGptAuth(authContent);
     const nextConfigContent = switchToOfficialCodexConfig(configContent);
 
     await writeTextAtomic(authPath, nextAuthContent);
     if (configContent || nextConfigContent) {
       await writeTextAtomic(configPath, nextConfigContent);
     }
+    await writeStore(store);
     const restart = await restartCodexForConfigChange(beforeSignature, configSignature(nextAuthContent, nextConfigContent));
 
-    launchCodexLogin();
+    if (!hasReusableLogin) {
+      launchCodexLogin();
+    }
 
     return {
       ok: true,
-      message: "已切换到官方 Codex，并打开登录窗口",
+      message: hasReusableLogin ? "已切换到官方 Codex，并继续使用原 ChatGPT 登录态" : "已切换到官方 Codex，并打开安全登录窗口",
       backupDir,
-      loginStarted: true,
+      loginStarted: !hasReusableLogin,
       restart,
-      profile: createOfficialProfile({ baseUrl: undefined, hasApiKey: false }),
+      profile: createOfficialProfile({ baseUrl: undefined, hasApiKey: false, connectionKind: "official" }),
       state: await getState()
     };
   } catch (error) {
@@ -1902,7 +2255,7 @@ async function probeDashboardBalanceInWebContents(webContents: WebContents, prof
   };
 }
 
-async function probeDashboardBalanceWithSession(profile: StoredProfile): Promise<DashboardBalanceProbe> {
+async function probeDashboardBalanceWithSessionNow(profile: StoredProfile): Promise<DashboardBalanceProbe> {
   const probeWindow = new BrowserWindow({
     show: false,
     width: 900,
@@ -1930,6 +2283,18 @@ async function probeDashboardBalanceWithSession(profile: StoredProfile): Promise
       probeWindow.close();
     }
   }
+}
+
+function probeDashboardBalanceWithSession(profile: StoredProfile): Promise<DashboardBalanceProbe> {
+  const probe = dashboardProbeQueue.then(
+    () => probeDashboardBalanceWithSessionNow(profile),
+    () => probeDashboardBalanceWithSessionNow(profile)
+  );
+  dashboardProbeQueue = probe.then(
+    () => undefined,
+    () => undefined
+  );
+  return probe;
 }
 
 async function fetchDashboardUsage(profile: StoredProfile): Promise<ProfileUsageSummary | undefined> {
@@ -2328,10 +2693,15 @@ function parseOfficialUsagePayload(payload: unknown): ProfileUsageSummary | unde
   return undefined;
 }
 
-async function fetchOfficialUsage(): Promise<ProfileUsageSummary> {
+async function fetchOfficialUsage(store: StoreFile): Promise<ProfileUsageSummary> {
   const { authPath } = paths();
   const auth = parseCodexAuthFileOrEmpty(await readTextIfExists(authPath));
-  const tokens = readChatGptTokens(auth);
+  let tokens = readChatGptTokens(auth);
+  let usingCachedToken = false;
+  if (!tokens.access_token) {
+    tokens = readCachedOfficialUsageTokens(store);
+    usingCachedToken = Boolean(tokens.access_token);
+  }
   if (!tokens.access_token) {
     return createUsageSummary("official", "unsupported", "官方余量", "未登录", "未检测到 ChatGPT 登录 token");
   }
@@ -2357,6 +2727,10 @@ async function fetchOfficialUsage(): Promise<ProfileUsageSummary> {
       });
       if (!response.ok) {
         lastMessage = `官方额度接口返回 ${response.status} ${response.statusText || ""}`.trim();
+        if (usingCachedToken && (response.status === 401 || response.status === 403)) {
+          delete store.preferences.officialUsageAuth;
+          return createUsageSummary("official", "unsupported", "官方余量", "登录已失效", "请切换到官方配置并重新登录", OFFICIAL_USAGE_ENDPOINT);
+        }
         continue;
       }
       const payload = await response.json();
@@ -2378,7 +2752,7 @@ async function refreshUsage(): Promise<OperationResult> {
   try {
     const store = await readStore();
     const [officialUsage, relayUsages] = await Promise.all([
-      fetchOfficialUsage(),
+      fetchOfficialUsage(store),
       Promise.all(store.profiles.map((profile) => fetchRelayUsage(profile)))
     ]);
 
@@ -2970,6 +3344,7 @@ function runProcess(command: string, args: string[], timeoutMs: number): Promise
 async function performCodexRestart(beforeSignature: string, afterSignature: string): Promise<CodexRestartResult> {
   if (beforeSignature === afterSignature) {
     return {
+      status: "not-needed",
       needed: false,
       attempted: false,
       restarted: false,
@@ -2978,89 +3353,95 @@ async function performCodexRestart(beforeSignature: string, afterSignature: stri
     };
   }
 
-  if (process.platform !== "win32") {
-    return {
-      needed: true,
-      attempted: false,
-      restarted: false,
-      processCount: 0,
-      message: "配置已变化；当前平台暂未自动重启 Codex"
-    };
-  }
+  // Never terminate Codex processes here. A backend may be executing a tool call;
+  // force-stopping it makes the desktop app report a 0xFFFFFFFF crash.
+  return {
+    status: "deferred",
+    needed: true,
+    attempted: false,
+    restarted: false,
+    processCount: 0,
+    message: "配置已保存；为保护正在运行的任务，不会强制重启 Codex，新任务或下次启动时生效"
+  };
 
+}
+
+async function restartCodexSafely(): Promise<OperationResult> {
+  if (process.platform !== "win32") {
+    return { ok: false, message: "当前平台暂不支持应用内安全重启 Codex" };
+  }
   const script = `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-$desktopProcesses = @(Get-CimInstance Win32_Process | Where-Object {
-  $_.ExecutablePath -match '\\\\OpenAI\\.Codex_.*\\\\app\\\\' -and
-  $_.Name -in @('Codex.exe', 'ChatGPT.exe', 'codex.exe', 'codex-code-mode-host.exe')
-})
-$main = @($desktopProcesses | Where-Object {
-  $_.Name -in @('Codex.exe', 'ChatGPT.exe') -and
-  $_.CommandLine -notmatch '--type=' -and
-  $_.ExecutablePath -match '\\\\app\\\\(Codex|ChatGPT)\\.exe$'
-})
-$backend = @($desktopProcesses | Where-Object {
-  $_.Name -in @('codex.exe', 'codex-code-mode-host.exe')
-})
-if ($main.Count -eq 0) {
-  @{ processCount = 0; restarted = $false; message = '未检测到运行中的 ChatGPT 桌面端，下次启动生效' } | ConvertTo-Json -Compress
+$sessionsRoot = Join-Path $HOME '.codex\\sessions'
+$latestSession = Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTimeUtc -Descending |
+  Select-Object -First 1
+if ($latestSession -and $latestSession.LastWriteTimeUtc -gt (Get-Date).ToUniversalTime().AddSeconds(-12)) {
+  @{ ok = $false; status = 'cancelled-active-task'; processCount = 0; message = '检测到 Codex 任务仍在活动，已取消重启；配置将在新任务中生效' } | ConvertTo-Json -Compress
   exit 0
 }
-$backendIds = @($backend | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
-if ($backendIds.Count -gt 0) {
-  foreach ($id in $backendIds) {
-    Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-  }
-  $backendDeadline = (Get-Date).AddSeconds(5)
-  while ((@($backendIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0) -and (Get-Date) -lt $backendDeadline) {
-    Start-Sleep -Milliseconds 100
-  }
-  @{ processCount = $backendIds.Count; restarted = $true; message = '已无感刷新 Codex 后台服务' } | ConvertTo-Json -Compress
+$ideHosts = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -eq 'codex.exe' -and
+  $_.CommandLine -match 'app-server' -and
+  $_.ExecutablePath -like '*\\.vscode\\extensions\\*'
+})
+$main = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.ExecutablePath -like '*\\OpenAI.Codex_*\\app\\*' -and
+  $_.Name -in @('Codex.exe', 'ChatGPT.exe') -and
+  $_.CommandLine -notmatch '--type=' -and
+  ($_.ExecutablePath -like '*\\app\\Codex.exe' -or $_.ExecutablePath -like '*\\app\\ChatGPT.exe')
+} | Select-Object -First 1)
+if ($main.Count -eq 0) {
+  @{ ok = $true; status = 'not-running'; processCount = 0; message = 'Codex 当前未运行，配置将在下次启动时生效' } | ConvertTo-Json -Compress
   exit 0
 }
 $exe = $main[0].ExecutablePath
-$ids = @($desktopProcesses | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
-foreach ($id in $ids) {
-  Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+$process = Get-Process -Id $main[0].ProcessId -ErrorAction Stop
+$requested = $process.CloseMainWindow()
+if (-not $requested) {
+  @{ ok = $false; status = 'refused'; processCount = 1; message = 'Codex 未接受安全关闭请求；未强制结束进程，请手动关闭后重新打开' } | ConvertTo-Json -Compress
+  exit 0
 }
-$deadline = (Get-Date).AddSeconds(5)
-while ((@($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0) -and (Get-Date) -lt $deadline) {
-  Start-Sleep -Milliseconds 100
+$deadline = (Get-Date).AddSeconds(12)
+while ((Get-Process -Id $process.Id -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+  Start-Sleep -Milliseconds 150
+}
+if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+  @{ ok = $false; status = 'refused'; processCount = 1; message = 'Codex 正在处理任务或拒绝退出；未强制结束进程' } | ConvertTo-Json -Compress
+  exit 0
 }
 Start-Process -FilePath $exe
-@{ processCount = $ids.Count; restarted = $true; message = '已自动重启 ChatGPT 桌面端' } | ConvertTo-Json -Compress
+if ($ideHosts.Count -gt 0) {
+  @{ ok = $true; status = 'restarted'; processCount = 1; message = "Codex 桌面端已安全重启；检测到 $($ideHosts.Count) 个 IDE Codex 后台，它们将在新任务中读取配置" } | ConvertTo-Json -Compress
+} else {
+  @{ ok = $true; status = 'restarted'; processCount = 1; message = 'Codex 桌面端已安全重启，新配置已生效' } | ConvertTo-Json -Compress
+}
 `;
-
-  const result = await runProcess("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], 12000);
+  const result = await runProcess("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], 16000);
   if (result.code !== 0) {
-    return {
-      needed: true,
-      attempted: true,
-      restarted: false,
-      processCount: 0,
-      message: result.stderr.trim() || "自动重启 Codex 失败"
-    };
+    const message = result.stderr.trim() || "安全重启 Codex 失败";
+    return { ok: false, message, restart: { status: "failed", needed: true, attempted: true, restarted: false, processCount: 0, message } };
   }
-
   try {
-    const parsed = JSON.parse(result.stdout.trim()) as CodexProcessSummary;
+    const parsed = JSON.parse(result.stdout.trim()) as { ok?: boolean; status?: CodexRestartResult["status"]; processCount?: number; message?: string };
+    const message = parsed.message || "安全重启操作已完成";
+    const status = parsed.status || (parsed.ok ? "restarted" : "failed");
     return {
-      needed: true,
-      attempted: true,
-      restarted: Boolean(parsed.restarted),
-      processCount: parsed.processCount || 0,
-      message: parsed.message || (parsed.restarted ? "已自动重启 Codex" : "未检测到运行中的 Codex")
+      ok: Boolean(parsed.ok),
+      message,
+      restart: {
+        status,
+        needed: true,
+        attempted: status !== "cancelled-active-task" && status !== "not-running",
+        restarted: status === "restarted",
+        processCount: parsed.processCount || 0,
+        message
+      }
     };
   } catch {
-    return {
-      needed: true,
-      attempted: true,
-      restarted: false,
-      processCount: 0,
-      message: "自动重启 Codex 的结果无法解析"
-    };
+    const message = "安全重启 Codex 的结果无法解析";
+    return { ok: false, message, restart: { status: "failed", needed: true, attempted: true, restarted: false, processCount: 0, message } };
   }
 }
 
@@ -3354,17 +3735,31 @@ async function checkLocalUpdate(): Promise<LocalUpdateInfo> {
   const sameVersionChanged =
     versionDelta === 0 &&
     Boolean(release.sha512) &&
-    (preference.installedSha512
-      ? preference.installedSha512 !== release.sha512
-      : Number.isFinite(releaseTime) && releaseTime > exeMtime + 60000);
-  const failedCurrentRelease = Boolean(release.sha512 && preference.failedSha512 === release.sha512);
-  const available = !failedCurrentRelease && (versionDelta > 0 || sameVersionChanged);
+    preference.installedSha512 !== release.sha512 &&
+    Number.isFinite(releaseTime) &&
+    releaseTime > exeMtime + 60000;
+  const installedCurrentRelease = Boolean(release.sha512 && preference.installedSha512 === release.sha512);
+  const failedCurrentRelease = Boolean(
+    release.sha512 && preference.failedSha512 === release.sha512 && !installedCurrentRelease
+  );
+  const pendingStartedAt = preference.lastInstallStartedAt ? Date.parse(preference.lastInstallStartedAt) : Number.NaN;
+  const pendingCurrentRelease = Boolean(
+    release.sha512 &&
+      preference.pendingSha512 === release.sha512 &&
+      Number.isFinite(pendingStartedAt) &&
+      Date.now() - pendingStartedAt < LOCAL_UPDATE_PENDING_TIMEOUT_MS
+  );
+  const available = !failedCurrentRelease && !pendingCurrentRelease && (versionDelta > 0 || sameVersionChanged);
 
   const nextPreference: LocalUpdatePreference = {
     ...preference,
     lastCheckedAt: nowIso()
   };
-  if (!available && release.sha512) {
+  if (installedCurrentRelease) {
+    delete nextPreference.failedSha512;
+    delete nextPreference.failedAt;
+  }
+  if (!available && !pendingCurrentRelease && !failedCurrentRelease && release.sha512) {
     nextPreference.installedSha512 = release.sha512;
     nextPreference.installedVersion = release.version;
   }
@@ -3379,7 +3774,9 @@ async function checkLocalUpdate(): Promise<LocalUpdateInfo> {
     installerPath: release.installerPath,
     message: available
       ? "发现本地 release 更新，准备自动安装"
-      : failedCurrentRelease
+      : pendingCurrentRelease
+        ? "更新安装正在进行，等待安装结果"
+        : failedCurrentRelease
         ? "这个更新安装失败，等待新的发布版本"
         : "当前已是本地 release 最新安装包"
   };
@@ -3551,9 +3948,21 @@ function scheduleLocalUpdateChecks(): void {
 
 function registerIpc(): void {
   ipcMain.handle("codex-switch:get-state", () => getState());
+  ipcMain.handle("codex-switch:read-profile-file", async (): Promise<ProfileFileSnapshot> => {
+    const { storagePath } = paths();
+    const content = await readTextIfExists(storagePath);
+    const stat = await fs.stat(storagePath).catch(() => undefined);
+    return {
+      path: storagePath,
+      content: content || `${JSON.stringify(await readStore(), null, 2)}\n`,
+      updatedAt: stat?.mtime.toISOString()
+    };
+  });
   ipcMain.handle("codex-switch:detect-provider", (_event, baseUrl: string) => detectProvider(baseUrl));
   ipcMain.handle("codex-switch:save-profile", (_event, input: SaveProfileInput) => saveProfile(input));
-  ipcMain.handle("codex-switch:apply-profile", (_event, profileId: string) => applyProfile(profileId));
+  ipcMain.handle("codex-switch:apply-profile", (_event, profileId: string, apiKeyId?: string) => applyProfile(profileId, apiKeyId));
+  ipcMain.handle("codex-switch:save-profile-api-key", (_event, input: SaveProfileApiKeyInput) => saveProfileApiKey(input));
+  ipcMain.handle("codex-switch:delete-profile-api-key", (_event, profileId: string, apiKeyId: string) => deleteProfileApiKey(profileId, apiKeyId));
   ipcMain.handle("codex-switch:delete-profile", (_event, profileId: string) => deleteProfile(profileId));
   ipcMain.handle("codex-switch:update-profile-tags", (_event, input: { profileId: string; tagIds: string[] }) =>
     updateProfileTags(input.profileId, input.tagIds)
@@ -3568,7 +3977,9 @@ function registerIpc(): void {
   ipcMain.handle("codex-switch:run-dynamic-endurance", () => runDynamicEndurance());
   ipcMain.handle("codex-switch:check-local-update", () => checkLocalUpdate());
   ipcMain.handle("codex-switch:install-local-update", () => installLocalUpdate());
+  ipcMain.handle("codex-switch:restart-codex", () => restartCodexSafely());
   ipcMain.handle("codex-switch:restore-backup", (_event, backupId: string) => restoreBackup(backupId));
+  ipcMain.handle("codex-switch:delete-backups", (_event, backupIds: string[]) => deleteBackups(backupIds));
   ipcMain.handle("codex-switch:reveal-path", async (_event, kind: "codexHome" | "storage" | "backupRoot") => {
     const location = paths();
     if (kind === "codexHome") {
@@ -3589,13 +4000,90 @@ function registerIpc(): void {
   });
 }
 
+function requestedProviderTokenProfileId(): string | undefined {
+  const flagIndex = process.argv.indexOf("--print-provider-token");
+  const profileId = flagIndex >= 0 ? process.argv[flagIndex + 1]?.trim() : "";
+  return profileId || undefined;
+}
+
+async function printProviderToken(profileId: string): Promise<void> {
+  const store = await readStore();
+  const profile = store.profiles.find((item) => item.id === profileId);
+  if (!profile) {
+    throw new Error("Codex Switch provider profile not found");
+  }
+  const token = decryptSecret(profile).trim();
+  if (!token || /[\r\n]/.test(token)) {
+    throw new Error("Codex Switch provider token is invalid");
+  }
+  await writeStreamSafely(process.stdout, token);
+}
+
+async function printRealChainDiagnostic(): Promise<void> {
+  const state = await getState();
+  const active = state.profiles.find((profile) => profile.isActive);
+  process.stdout.write(`${JSON.stringify({
+    connectionKind: state.current.connectionKind,
+    connectionMessage: state.current.connectionMessage,
+    authMode: state.current.authMode,
+    providerName: state.current.providerName,
+    baseUrl: state.current.baseUrl,
+    hasApiKey: state.current.hasApiKey,
+    matchedProfileId: state.current.matchedProfileId,
+    activeProfileName: active?.name
+  }, null, 2)}\n`);
+}
+
 if (process.platform === "win32") {
   app.setAppUserModelId(APP_USER_MODEL_ID);
 }
 
-const hasSingleInstanceLock = app.requestSingleInstanceLock();
+const providerTokenProfileId = requestedProviderTokenProfileId();
+const realChainDiagnostic = process.argv.includes("--diagnose-real-chain");
+const safeRestartDiagnostic = process.argv.includes("--diagnose-safe-restart");
+const commandMode = Boolean(providerTokenProfileId || realChainDiagnostic || safeRestartDiagnostic);
+if (commandMode) {
+  // Command callers commonly close their pipes immediately after receiving the
+  // token. Exit synchronously so Electron's own exception dialog cannot race us.
+  installBrokenPipeGuards(() => process.exit(0));
+}
+const hasSingleInstanceLock = providerTokenProfileId || realChainDiagnostic || safeRestartDiagnostic ? false : app.requestSingleInstanceLock();
 
-if (!hasSingleInstanceLock) {
+if (safeRestartDiagnostic) {
+  app.whenReady()
+    .then(() => restartCodexSafely())
+    .then((result) => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
+    .then(() => app.exit(0))
+    .catch((error) => {
+      if (!isBrokenPipeError(error)) {
+        void writeStreamSafely(process.stderr, `${normalizeError(error)}\n`).finally(() => app.exit(1));
+        return;
+      }
+      process.exit(0);
+    });
+} else if (realChainDiagnostic) {
+  app.whenReady()
+    .then(() => printRealChainDiagnostic())
+    .then(() => app.exit(0))
+    .catch((error) => {
+      if (!isBrokenPipeError(error)) {
+        void writeStreamSafely(process.stderr, `${normalizeError(error)}\n`).finally(() => app.exit(1));
+        return;
+      }
+      process.exit(0);
+    });
+} else if (providerTokenProfileId) {
+  app.whenReady()
+    .then(() => printProviderToken(providerTokenProfileId))
+    .then(() => app.exit(0))
+    .catch((error) => {
+      if (!isBrokenPipeError(error)) {
+        void writeStreamSafely(process.stderr, `${normalizeError(error)}\n`).finally(() => app.exit(1));
+        return;
+      }
+      process.exit(0);
+    });
+} else if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
@@ -3612,7 +4100,11 @@ if (!hasSingleInstanceLock) {
     mainWindow.focus();
   });
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    app.on("child-process-gone", (_event, details) => {
+      void appendDiagnosticLog("child-process-gone", details);
+    });
+    await migrateLegacyOfficialAuth().catch((error) => appendDiagnosticLog("legacy-auth-migration-failed", normalizeError(error)));
     registerIpc();
     createWindow();
     startDynamicSessionWatcher();

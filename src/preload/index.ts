@@ -9,9 +9,12 @@ import type {
 
 const api: CodexSwitchApi = {
   getState: () => ipcRenderer.invoke("codex-switch:get-state"),
+  readProfileFile: () => ipcRenderer.invoke("codex-switch:read-profile-file"),
   detectProvider: (baseUrl: string) => ipcRenderer.invoke("codex-switch:detect-provider", baseUrl),
   saveProfile: (input: SaveProfileInput) => ipcRenderer.invoke("codex-switch:save-profile", input),
-  applyProfile: (profileId: string) => ipcRenderer.invoke("codex-switch:apply-profile", profileId),
+  applyProfile: (profileId: string, apiKeyId?: string) => ipcRenderer.invoke("codex-switch:apply-profile", profileId, apiKeyId),
+  saveProfileApiKey: (input) => ipcRenderer.invoke("codex-switch:save-profile-api-key", input),
+  deleteProfileApiKey: (profileId: string, apiKeyId: string) => ipcRenderer.invoke("codex-switch:delete-profile-api-key", profileId, apiKeyId),
   deleteProfile: (profileId: string) => ipcRenderer.invoke("codex-switch:delete-profile", profileId),
   updateProfileTags: (input: UpdateProfileTagsInput) => ipcRenderer.invoke("codex-switch:update-profile-tags", input),
   importCurrentConfig: () => ipcRenderer.invoke("codex-switch:import-current"),
@@ -23,7 +26,9 @@ const api: CodexSwitchApi = {
   runDynamicEndurance: () => ipcRenderer.invoke("codex-switch:run-dynamic-endurance"),
   checkLocalUpdate: () => ipcRenderer.invoke("codex-switch:check-local-update"),
   installLocalUpdate: () => ipcRenderer.invoke("codex-switch:install-local-update"),
+  restartCodex: () => ipcRenderer.invoke("codex-switch:restart-codex"),
   restoreBackup: (backupId: string) => ipcRenderer.invoke("codex-switch:restore-backup", backupId),
+  deleteBackups: (backupIds: string[]) => ipcRenderer.invoke("codex-switch:delete-backups", backupIds),
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => ipcRenderer.invoke("codex-switch:reveal-path", kind),
   openExternal: (url: string) => ipcRenderer.invoke("codex-switch:open-external", url)
 };

@@ -2,6 +2,8 @@ export type TestStatus = "idle" | "testing" | "ok" | "failed";
 export type TagMetric = "stability" | "price" | "dilution" | "speed";
 export type TagLevel = "high" | "medium" | "low";
 export type ProfileKind = "official" | "custom";
+export type CodexConnectionKind = "official" | "relay" | "unknown" | "error";
+export type CodexRestartStatus = "not-needed" | "deferred" | "restarted" | "not-running" | "cancelled-active-task" | "refused" | "failed";
 export type UsageStatus = "unknown" | "ok" | "unsupported" | "failed";
 export type DynamicEnduranceStrategy = "economy" | "quality";
 
@@ -43,6 +45,7 @@ export interface DashboardAuthStatus {
 }
 
 export interface CodexRestartResult {
+  status: CodexRestartStatus;
   needed: boolean;
   attempted: boolean;
   restarted: boolean;
@@ -56,6 +59,16 @@ export interface ProfileTag {
   metric: TagMetric;
   level: TagLevel;
   color: string;
+}
+
+export interface ProfileApiKey {
+  id: string;
+  preview: string;
+  hash: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+  isActive: boolean;
 }
 
 export interface ProviderDetection {
@@ -76,6 +89,8 @@ export interface PublicProfile extends ProviderDetection {
   baseUrl: string;
   apiKeyPreview: string;
   apiKeyHash: string;
+  apiKeys: ProfileApiKey[];
+  activeApiKeyId: string;
   createdAt: string;
   updatedAt: string;
   lastAppliedAt?: string;
@@ -100,6 +115,8 @@ export interface CurrentCodexConfig {
   hasApiKey: boolean;
   apiKeyPreview?: string;
   matchedProfileId?: string;
+  connectionKind: CodexConnectionKind;
+  connectionMessage: string;
 }
 
 export interface BackupRecord {
@@ -126,11 +143,18 @@ export interface SaveProfileInput {
   id?: string;
   baseUrl: string;
   apiKey?: string;
+  apiKeyNotes?: string;
   name?: string;
   iconUrl?: string;
   color?: string;
   notes?: string;
   tagIds?: string[];
+}
+
+export interface SaveProfileApiKeyInput {
+  profileId: string;
+  apiKey: string;
+  notes?: string;
 }
 
 export interface UpdateProfileTagsInput {
@@ -170,11 +194,20 @@ export interface LocalUpdateInfo {
   message: string;
 }
 
+export interface ProfileFileSnapshot {
+  path: string;
+  content: string;
+  updatedAt?: string;
+}
+
 export interface CodexSwitchApi {
   getState: () => Promise<AppState>;
+  readProfileFile: () => Promise<ProfileFileSnapshot>;
   detectProvider: (baseUrl: string) => Promise<ProviderDetection>;
   saveProfile: (input: SaveProfileInput) => Promise<OperationResult>;
-  applyProfile: (profileId: string) => Promise<OperationResult>;
+  applyProfile: (profileId: string, apiKeyId?: string) => Promise<OperationResult>;
+  saveProfileApiKey: (input: SaveProfileApiKeyInput) => Promise<OperationResult>;
+  deleteProfileApiKey: (profileId: string, apiKeyId: string) => Promise<OperationResult>;
   deleteProfile: (profileId: string) => Promise<OperationResult>;
   updateProfileTags: (input: UpdateProfileTagsInput) => Promise<OperationResult>;
   importCurrentConfig: () => Promise<OperationResult>;
@@ -185,7 +218,9 @@ export interface CodexSwitchApi {
   runDynamicEndurance: () => Promise<OperationResult>;
   checkLocalUpdate: () => Promise<LocalUpdateInfo>;
   installLocalUpdate: () => Promise<OperationResult>;
+  restartCodex: () => Promise<OperationResult>;
   restoreBackup: (backupId: string) => Promise<OperationResult>;
+  deleteBackups: (backupIds: string[]) => Promise<OperationResult>;
   revealPath: (kind: "codexHome" | "storage" | "backupRoot") => Promise<void>;
   openExternal: (url: string) => Promise<void>;
 }
