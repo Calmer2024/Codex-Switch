@@ -24,8 +24,14 @@ const api: CodexSwitchApi = {
   updateDynamicEndurance: (input: UpdateDynamicEnduranceInput) =>
     ipcRenderer.invoke("codex-switch:update-dynamic-endurance", input),
   runDynamicEndurance: () => ipcRenderer.invoke("codex-switch:run-dynamic-endurance"),
+  getLocalUpdateState: () => ipcRenderer.invoke("codex-switch:get-local-update-state"),
   checkLocalUpdate: () => ipcRenderer.invoke("codex-switch:check-local-update"),
   installLocalUpdate: () => ipcRenderer.invoke("codex-switch:install-local-update"),
+  onLocalUpdateState: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: Parameters<typeof listener>[0]) => listener(state);
+    ipcRenderer.on("codex-switch:local-update-state", handler);
+    return () => ipcRenderer.removeListener("codex-switch:local-update-state", handler);
+  },
   restartCodex: () => ipcRenderer.invoke("codex-switch:restart-codex"),
   restoreBackup: (backupId: string) => ipcRenderer.invoke("codex-switch:restore-backup", backupId),
   deleteBackups: (backupIds: string[]) => ipcRenderer.invoke("codex-switch:delete-backups", backupIds),

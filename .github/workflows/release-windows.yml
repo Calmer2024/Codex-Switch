@@ -1,0 +1,66 @@
+name: Release signed Windows installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($packageVersion -ne $tagVersion) {
+            throw "Tag v$tagVersion does not match package version $packageVersion"
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build Windows installer
+        run: npm run release:win
+
+      - name: Publish GitHub Release and update metadata
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $artifacts = @(
+            "release\Codex-Switch-Setup-$version.exe",
+            "release\Codex-Switch-Setup-$version.exe.blockmap",
+            "release\latest.yml"
+          )
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @artifacts --clobber
+          } else {
+            gh release create $tag @artifacts --title "Codex Switch $version" --generate-notes
+          }

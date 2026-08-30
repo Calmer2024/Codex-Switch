@@ -1937,6 +1937,45 @@ button:disabled {
   padding-top: 2px;
 }
 
+.app-update-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  padding: 0;
+  border: 1px solid #f0f0f1;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #27a861;
+  box-shadow: 0 10px 24px rgb(17 18 24 / 0.04);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.app-update-button:hover:not(:disabled) {
+  border-color: #dedfe4;
+  box-shadow: 0 12px 28px rgb(39 168 97 / 0.14);
+  transform: translateY(-1px);
+}
+
+.app-update-button.downloading svg {
+  animation: update-download-pulse 900ms ease-in-out infinite alternate;
+}
+
+.app-update-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+@keyframes update-download-pulse {
+  from { transform: translateY(-2px); opacity: 0.55; }
+  to { transform: translateY(2px); opacity: 1; }
+}
+
 .sync-usage-button {
   display: inline-flex;
   align-items: center;
@@ -3007,6 +3046,14 @@ button:disabled {
   margin-top: 5px;
   color: #818793;
   font-size: 12px;
+}
+
+.experimental-note {
+  display: block;
+  margin-top: 4px;
+  color: #b7791f;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .switch-toggle {

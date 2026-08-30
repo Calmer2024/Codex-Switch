@@ -445,14 +445,24 @@ export function createMockCodexSwitchApi(): CodexSwitchApi {
       return result("已连接网页登录态，当前余额 $6.17");
     },
     checkLocalUpdate: async () => ({
-      available: false,
-      currentVersion: "0.1.0",
-      message: "开发预览不安装更新"
+      status: "available",
+      available: true,
+      currentVersion: "1.0.13",
+      version: "1.0.14",
+      message: "发现新版本 1.0.14（开发预览）"
+    }),
+    getLocalUpdateState: async () => ({
+      status: "available",
+      available: true,
+      currentVersion: "1.0.13",
+      version: "1.0.14",
+      message: "发现新版本 1.0.14（开发预览）"
     }),
     installLocalUpdate: async () => ({
       ok: false,
       message: "开发预览不安装更新"
     }),
+    onLocalUpdateState: () => () => undefined,
     restartCodex: async () => result("开发预览不会重启 Codex"),
     restoreBackup: async (backupId: string) => {
       const backup = mockState.backups.find((item) => item.id === backupId);

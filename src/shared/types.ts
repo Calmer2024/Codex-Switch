@@ -186,11 +186,12 @@ export interface OperationResult {
 }
 
 export interface LocalUpdateInfo {
+  status: "idle" | "checking" | "available" | "downloading" | "downloaded" | "up-to-date" | "error" | "unsupported";
   available: boolean;
   currentVersion: string;
   version?: string;
   releaseDate?: string;
-  installerPath?: string;
+  percent?: number;
   message: string;
 }
 
@@ -216,8 +217,10 @@ export interface CodexSwitchApi {
   connectDashboardAuth: (profileId: string) => Promise<OperationResult>;
   updateDynamicEndurance: (input: UpdateDynamicEnduranceInput) => Promise<OperationResult>;
   runDynamicEndurance: () => Promise<OperationResult>;
+  getLocalUpdateState: () => Promise<LocalUpdateInfo>;
   checkLocalUpdate: () => Promise<LocalUpdateInfo>;
   installLocalUpdate: () => Promise<OperationResult>;
+  onLocalUpdateState: (listener: (state: LocalUpdateInfo) => void) => () => void;
   restartCodex: () => Promise<OperationResult>;
   restoreBackup: (backupId: string) => Promise<OperationResult>;
   deleteBackups: (backupIds: string[]) => Promise<OperationResult>;

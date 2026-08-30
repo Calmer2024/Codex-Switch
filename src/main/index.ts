@@ -1,7 +1,9 @@
 import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
 import type { WebContents } from "electron";
+import electronLog from "electron-log/main";
+import electronUpdater from "electron-updater";
 import { spawn } from "node:child_process";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { promises as fs } from "node:fs";
 import { watch } from "node:fs";
 import os from "node:os";
@@ -25,6 +27,13 @@ import type {
   UpdateDynamicEnduranceInput
 } from "../shared/types";
 import { classifyCodexConnection } from "./codex-state";
+import {
+  buildWindowsLoginLaunch,
+  buildWindowsStatusInvocation,
+  codexCommandCandidates,
+  parseCodexLoginStatus,
+  type CodexCliLoginKind
+} from "./codex-cli";
 import { installBrokenPipeGuards, isBrokenPipeError, writeStreamSafely } from "./stdio";
 
 // Codex Switch renders a simple 2D UI and never plays audio. Disabling these
@@ -121,27 +130,6 @@ interface LocalUpdatePreference {
   failedAt?: string;
 }
 
-interface LocalUpdateResult {
-  status: "success" | "failed";
-  version?: string;
-  sha512?: string;
-  exitCode?: number;
-  message?: string;
-}
-
-interface DevUpdateConfig {
-  enabled?: boolean;
-  releaseDir?: string;
-  channelFile?: string;
-}
-
-interface LocalReleaseInfo {
-  version: string;
-  releaseDate?: string;
-  sha512?: string;
-  installerPath: string;
-}
-
 interface DashboardTokenSnapshot {
   accessToken: string;
   refreshToken?: string;
@@ -189,7 +177,6 @@ const API_KEY_AUTH_MODE = "apikey";
 const CHATGPT_AUTH_MODE = "chatgpt";
 const DEFAULT_PROVIDER_NAME = "OpenAI";
 const SWITCH_PROVIDER_ID = "codex_switch";
-const AUTH_CREDENTIALS_STORE_FIELD = "cli_auth_credentials_store";
 const FORCED_LOGIN_METHOD_FIELD = "forced_login_method";
 const APP_USER_MODEL_ID = "dev.codex-switch.app";
 const OFFICIAL_PROFILE_ID = "official-codex-chatgpt";
@@ -204,9 +191,7 @@ const DASHBOARD_AUTH_TIMEOUT_MS = 6500;
 const BALANCE_RETRY_COUNT = 2;
 const BALANCE_RETRY_DELAY_MS = 420;
 const LOCAL_UPDATE_INITIAL_CHECK_MS = 8000;
-const LOCAL_UPDATE_CHECK_INTERVAL_MS = 60000;
-const LOCAL_UPDATE_RESULT_FILE = "update-result.json";
-const LOCAL_UPDATE_PENDING_TIMEOUT_MS = 15 * 60 * 1000;
+const LOCAL_UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const DYNAMIC_ACTIVITY_DEBOUNCE_MS = 6500;
 const CODEX_RESTART_DEBOUNCE_MS = 450;
 const USAGE_SYNC_INTERVAL_FRIENDLY_NAME = "额度同步";
@@ -219,6 +204,13 @@ const activeTestTimeouts = new Set<ReturnType<typeof setTimeout>>();
 let forceExitTimer: ReturnType<typeof setTimeout> | undefined;
 let localUpdateTimer: ReturnType<typeof setInterval> | undefined;
 let localUpdateInstallInProgress = false;
+let updaterConfigured = false;
+let localUpdateState: LocalUpdateInfo = {
+  status: "idle",
+  available: false,
+  currentVersion: app.getVersion(),
+  message: "尚未检查更新"
+};
 let mainWindow: BrowserWindow | null = null;
 let dynamicActivityTimer: ReturnType<typeof setTimeout> | undefined;
 let dynamicSessionWatcher: import("node:fs").FSWatcher | undefined;
@@ -972,7 +964,6 @@ function upsertCodexConfig(content: string, baseUrl: string, profileId: string, 
   const escapedTokenCommandPath = escapeTomlString(tokenCommandPath);
   let next = content.trim() ? content : "";
   next = removeTomlNamespace(next, `model_providers.${SWITCH_PROVIDER_ID}`);
-  next = upsertTopLevelTomlString(next, AUTH_CREDENTIALS_STORE_FIELD, "file");
 
   if (/^model_provider\s*=.*$/m.test(next)) {
     next = next.replace(/^model_provider\s*=.*$/m, `model_provider = "${SWITCH_PROVIDER_ID}"`);
@@ -1033,32 +1024,60 @@ function switchToOfficialCodexConfig(content: string): string {
   next = removeTomlNamespace(next, `model_providers.${SWITCH_PROVIDER_ID}`);
   // Remove configurations written by Codex Switch 1.0.x, but leave unrelated custom providers intact.
   next = removeTomlNamespace(next, `model_providers.${DEFAULT_PROVIDER_NAME}`);
-  next = upsertTopLevelTomlString(next, AUTH_CREDENTIALS_STORE_FIELD, "file");
   next = removeEmptyTomlSection(next, "model_providers");
   return compactConfigWhitespace(next, newline);
 }
 
-function launchCodexLogin(): void {
-  if (process.platform === "win32") {
-    const child = spawn(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/k','codex login' -WindowStyle Normal"
-      ],
-      { detached: true, stdio: "ignore", windowsHide: false }
-    );
-    child.on("error", () => undefined);
-    child.unref();
-    return;
+interface CodexLoginProbe {
+  kind: CodexCliLoginKind;
+  command?: string;
+}
+
+function commandWasNotFound(stderr: string): boolean {
+  return /ENOENT|not recognized|cannot find|找不到|不是内部或外部命令/i.test(stderr);
+}
+
+async function probeCodexLogin(): Promise<CodexLoginProbe> {
+  for (const candidate of codexCommandCandidates(process.platform, process.env)) {
+    if (isAbsolute(candidate) && !(await fileExists(candidate))) {
+      continue;
+    }
+
+    const invocation = process.platform === "win32"
+      ? buildWindowsStatusInvocation(candidate)
+      : { command: candidate, args: ["login", "status"] };
+    const result = await runProcess(invocation.command, invocation.args, 5000);
+    if (commandWasNotFound(result.stderr)) {
+      continue;
+    }
+
+    return {
+      kind: parseCodexLoginStatus(result.code, result.stdout, result.stderr),
+      command: candidate
+    };
   }
 
-  const child = spawn("codex", ["login"], { detached: true, stdio: "ignore" });
-  child.on("error", () => undefined);
-  child.unref();
+  return { kind: "unknown" };
+}
+
+function spawnDetached(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: false });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+async function launchCodexLogin(codexCommand: string): Promise<void> {
+  if (process.platform === "win32") {
+    const launch = buildWindowsLoginLaunch(codexCommand);
+    await spawnDetached(launch.command, launch.args);
+    return;
+  }
+  await spawnDetached(codexCommand, ["login"]);
 }
 
 async function createBackup(profile: BackupSubject): Promise<string> {
@@ -1216,10 +1235,15 @@ async function readCurrentConfig(): Promise<{
   hasApiKey: boolean;
   apiKeyPreview?: string;
   hasChatGptToken: boolean;
+  cliLoginKind: CodexCliLoginKind;
   authError?: string;
 }> {
   const { authPath, configPath } = paths();
-  const [authContent, configContent] = await Promise.all([readTextIfExists(authPath), readTextIfExists(configPath)]);
+  const [authContent, configContent, cliLogin] = await Promise.all([
+    readTextIfExists(authPath),
+    readTextIfExists(configPath),
+    probeCodexLogin()
+  ]);
   let auth: CodexAuthFile = {};
   let authError: string | undefined;
   try {
@@ -1242,6 +1266,7 @@ async function readCurrentConfig(): Promise<{
     hasApiKey: Boolean(api.value),
     apiKeyPreview: api.value ? previewSecret(api.value) : undefined,
     hasChatGptToken: Boolean(readChatGptTokens(auth).access_token),
+    cliLoginKind: cliLogin.kind,
     authError
   };
 }
@@ -1524,7 +1549,13 @@ async function applyOfficialProfile(): Promise<OperationResult> {
     assertLoginMethodAllowed(configContent, "chatgpt");
     const auth = parseCodexAuthFileOrEmpty(authContent);
     cacheOfficialUsageAuth(store, auth);
-    const hasReusableLogin = auth.auth_mode === CHATGPT_AUTH_MODE && Boolean(readChatGptTokens(auth).access_token);
+    const cliLogin = await probeCodexLogin();
+    const hasReusableLogin =
+      cliLogin.kind === "chatgpt" ||
+      (auth.auth_mode === CHATGPT_AUTH_MODE && Boolean(readChatGptTokens(auth).access_token));
+    if (!hasReusableLogin && !cliLogin.command) {
+      throw new Error("未找到 Codex CLI。请先安装 Codex，或通过 CODEX_EXECUTABLE 指定 codex 可执行文件路径");
+    }
     const beforeSignature = configSignature(authContent, configContent);
     const nextAuthContent = hasReusableLogin ? authContent : switchToChatGptAuth(authContent);
     const nextConfigContent = switchToOfficialCodexConfig(configContent);
@@ -1537,7 +1568,7 @@ async function applyOfficialProfile(): Promise<OperationResult> {
     const restart = await restartCodexForConfigChange(beforeSignature, configSignature(nextAuthContent, nextConfigContent));
 
     if (!hasReusableLogin) {
-      launchCodexLogin();
+      await launchCodexLogin(cliLogin.command!);
     }
 
     return {
@@ -3563,379 +3594,161 @@ async function testProfile(input: TestProfileInput): Promise<OperationResult> {
   }
 }
 
-function unquoteYamlValue(value: string): string {
-  const trimmed = value.replace(/\s+#.*$/, "").trim();
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
+const { autoUpdater } = electronUpdater;
+
+function supportsOnlineUpdate(): boolean {
+  return app.isPackaged && !process.env.PORTABLE_EXECUTABLE_DIR && !process.env.PORTABLE_EXECUTABLE_FILE;
 }
 
-function readYamlValue(content: string, key: string): string | undefined {
-  const match = new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, "im").exec(content);
-  return match ? unquoteYamlValue(match[1]) : undefined;
-}
-
-function parseLatestYml(content: string): Omit<LocalReleaseInfo, "installerPath"> | undefined {
-  const version = readYamlValue(content, "version");
-  const pathName = readYamlValue(content, "path") || readYamlValue(content, "url");
-  if (!version || !pathName) {
-    return undefined;
-  }
-
-  return {
-    version,
-    releaseDate: readYamlValue(content, "releaseDate"),
-    sha512: readYamlValue(content, "sha512")
+function publishLocalUpdateState(patch: Partial<LocalUpdateInfo>): LocalUpdateInfo {
+  localUpdateState = {
+    ...localUpdateState,
+    ...patch,
+    currentVersion: app.getVersion()
   };
+  mainWindow?.webContents.send("codex-switch:local-update-state", localUpdateState);
+  return localUpdateState;
 }
 
-function compareVersions(left: string, right: string): number {
-  const leftParts = left.split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const rightParts = right.split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const count = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < count; index += 1) {
-    const diff = (leftParts[index] || 0) - (rightParts[index] || 0);
-    if (diff !== 0) {
-      return diff > 0 ? 1 : -1;
-    }
+function configureAutoUpdater(): void {
+  if (updaterConfigured || !supportsOnlineUpdate()) {
+    return;
   }
-  return 0;
+  updaterConfigured = true;
+  electronLog.transports.file.level = "info";
+  autoUpdater.logger = electronLog;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on("checking-for-update", () => {
+    publishLocalUpdateState({ status: "checking", available: false, percent: undefined, message: "正在检查更新" });
+  });
+  autoUpdater.on("update-available", (info) => {
+    publishLocalUpdateState({
+      status: "available",
+      available: true,
+      version: info.version,
+      releaseDate: info.releaseDate,
+      percent: 0,
+      message: `发现新版本 ${info.version}`
+    });
+  });
+  autoUpdater.on("update-not-available", (info) => {
+    publishLocalUpdateState({
+      status: "up-to-date",
+      available: false,
+      version: info.version,
+      releaseDate: info.releaseDate,
+      percent: undefined,
+      message: "当前已是最新版本"
+    });
+  });
+  autoUpdater.on("download-progress", (progress) => {
+    publishLocalUpdateState({
+      status: "downloading",
+      available: true,
+      percent: Math.max(0, Math.min(100, progress.percent)),
+      message: `正在下载更新 ${Math.round(progress.percent)}%`
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    publishLocalUpdateState({
+      status: "downloaded",
+      available: true,
+      version: info.version,
+      releaseDate: info.releaseDate,
+      percent: 100,
+      message: "更新已下载，正在准备安装"
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    localUpdateInstallInProgress = false;
+    publishLocalUpdateState({
+      status: "error",
+      available: localUpdateState.available,
+      message: `更新失败：${normalizeError(error)}`
+    });
+  });
 }
 
-function devUpdateConfigCandidates(): string[] {
-  return app.isPackaged
-    ? [join(process.resourcesPath, "dev-update.json")]
-    : [join(__dirname, "../../build/dev-update.json")];
-}
-
-async function readDevUpdateConfig(): Promise<DevUpdateConfig | undefined> {
-  for (const candidate of devUpdateConfigCandidates()) {
-    const raw = await readTextIfExists(candidate);
-    if (!raw.trim()) {
-      continue;
-    }
-    const parsed = JSON.parse(raw) as DevUpdateConfig;
-    if (parsed.enabled === false || !parsed.releaseDir) {
-      return undefined;
-    }
+function getLocalUpdateState(): LocalUpdateInfo {
+  if (!supportsOnlineUpdate()) {
     return {
-      enabled: parsed.enabled,
-      releaseDir: isAbsolute(parsed.releaseDir) ? parsed.releaseDir : resolve(dirname(candidate), parsed.releaseDir),
-      channelFile: parsed.channelFile || "latest.yml"
+      status: "unsupported",
+      available: false,
+      currentVersion: app.getVersion(),
+      message: app.isPackaged ? "便携版请从 GitHub Releases 下载新版" : "开发模式不执行在线更新"
     };
   }
-  return undefined;
-}
-
-async function findLocalInstallerPath(releaseDir: string, pathName: string, version: string): Promise<string | undefined> {
-  const normalizedPathName = pathName.replace(/\//g, "\\");
-  const directCandidate = join(releaseDir, normalizedPathName);
-  try {
-    await fs.access(directCandidate);
-    return directCandidate;
-  } catch {
-    // Fall through to compatibility names.
-  }
-
-  const spacedCandidate = join(releaseDir, normalizedPathName.replace(/-/g, " "));
-  try {
-    await fs.access(spacedCandidate);
-    return spacedCandidate;
-  } catch {
-    // Fall through to scanning the release directory.
-  }
-
-  const entries = await fs.readdir(releaseDir, { withFileTypes: true }).catch(() => []);
-  const candidates = await Promise.all(
-    entries
-      .filter((entry) => {
-        const name = entry.name.toLowerCase();
-        return entry.isFile() && name.endsWith(".exe") && name.includes("setup") && (!version || name.includes(version));
-      })
-      .map(async (entry) => {
-        const candidatePath = join(releaseDir, entry.name);
-        const stat = await fs.stat(candidatePath);
-        return { path: candidatePath, mtimeMs: stat.mtimeMs };
-      })
-  );
-
-  return candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.path;
-}
-
-async function readLatestLocalRelease(config: DevUpdateConfig): Promise<LocalReleaseInfo | undefined> {
-  if (!config.releaseDir) {
-    return undefined;
-  }
-  const channelPath = join(config.releaseDir, config.channelFile || "latest.yml");
-  const raw = await readTextIfExists(channelPath);
-  if (!raw.trim()) {
-    return undefined;
-  }
-
-  const parsed = parseLatestYml(raw);
-  const pathName = readYamlValue(raw, "path") || readYamlValue(raw, "url");
-  if (!parsed || !pathName) {
-    return undefined;
-  }
-
-  const installerPath = await findLocalInstallerPath(config.releaseDir, pathName, parsed.version);
-  if (!installerPath) {
-    return undefined;
-  }
-
-  return {
-    ...parsed,
-    installerPath
-  };
-}
-
-async function currentExecutableMtimeMs(): Promise<number> {
-  try {
-    const stat = await fs.stat(process.execPath);
-    return stat.mtimeMs;
-  } catch {
-    return 0;
-  }
+  return localUpdateState;
 }
 
 async function checkLocalUpdate(): Promise<LocalUpdateInfo> {
-  const currentVersion = app.getVersion();
-  if (!app.isPackaged) {
-    return {
-      available: false,
-      currentVersion,
-      message: "开发模式只生成更新配置，不自动安装更新"
-    };
+  if (!supportsOnlineUpdate()) {
+    return getLocalUpdateState();
   }
-
-  const config = await readDevUpdateConfig();
-  if (!config?.releaseDir) {
-    return {
-      available: false,
-      currentVersion,
-      message: "未找到本地 release 更新通道"
-    };
+  configureAutoUpdater();
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    publishLocalUpdateState({ status: "error", available: false, message: `检查更新失败：${normalizeError(error)}` });
   }
-
-  const release = await readLatestLocalRelease(config);
-  if (!release) {
-    return {
-      available: false,
-      currentVersion,
-      message: "本地 release 目录没有可安装的新版本"
-    };
-  }
-
-  const store = await readStore();
-  const preference = store.preferences.localUpdate || {};
-  const versionDelta = compareVersions(release.version, currentVersion);
-  const releaseTime = release.releaseDate ? Date.parse(release.releaseDate) : Number.NaN;
-  const exeMtime = await currentExecutableMtimeMs();
-  const sameVersionChanged =
-    versionDelta === 0 &&
-    Boolean(release.sha512) &&
-    preference.installedSha512 !== release.sha512 &&
-    Number.isFinite(releaseTime) &&
-    releaseTime > exeMtime + 60000;
-  const installedCurrentRelease = Boolean(release.sha512 && preference.installedSha512 === release.sha512);
-  const failedCurrentRelease = Boolean(
-    release.sha512 && preference.failedSha512 === release.sha512 && !installedCurrentRelease
-  );
-  const pendingStartedAt = preference.lastInstallStartedAt ? Date.parse(preference.lastInstallStartedAt) : Number.NaN;
-  const pendingCurrentRelease = Boolean(
-    release.sha512 &&
-      preference.pendingSha512 === release.sha512 &&
-      Number.isFinite(pendingStartedAt) &&
-      Date.now() - pendingStartedAt < LOCAL_UPDATE_PENDING_TIMEOUT_MS
-  );
-  const available = !failedCurrentRelease && !pendingCurrentRelease && (versionDelta > 0 || sameVersionChanged);
-
-  const nextPreference: LocalUpdatePreference = {
-    ...preference,
-    lastCheckedAt: nowIso()
-  };
-  if (installedCurrentRelease) {
-    delete nextPreference.failedSha512;
-    delete nextPreference.failedAt;
-  }
-  if (!available && !pendingCurrentRelease && !failedCurrentRelease && release.sha512) {
-    nextPreference.installedSha512 = release.sha512;
-    nextPreference.installedVersion = release.version;
-  }
-  store.preferences.localUpdate = nextPreference;
-  await writeStore(store);
-
-  return {
-    available,
-    currentVersion,
-    version: release.version,
-    releaseDate: release.releaseDate,
-    installerPath: release.installerPath,
-    message: available
-      ? "发现本地 release 更新，准备自动安装"
-      : pendingCurrentRelease
-        ? "更新安装正在进行，等待安装结果"
-        : failedCurrentRelease
-        ? "这个更新安装失败，等待新的发布版本"
-        : "当前已是本地 release 最新安装包"
-  };
-}
-
-function quotePowerShellString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-async function launchLocalUpdateInstaller(installerPath: string, version?: string, sha512?: string): Promise<void> {
-  const resultPath = join(app.getPath("userData"), LOCAL_UPDATE_RESULT_FILE);
-  const runnerPath = join(app.getPath("userData"), "update-runner.ps1");
-  const logPath = join(app.getPath("userData"), "update.log");
-  const appPath = process.execPath;
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `$parentId = ${process.pid}`,
-    `$installerPath = ${quotePowerShellString(installerPath)}`,
-    `$appPath = ${quotePowerShellString(appPath)}`,
-    `$resultPath = ${quotePowerShellString(resultPath)}`,
-    `$logPath = ${quotePowerShellString(logPath)}`,
-    `$version = ${quotePowerShellString(version || "")}`,
-    `$sha512 = ${quotePowerShellString(sha512 || "")}`,
-    "$result = @{ status = 'failed'; version = $version; sha512 = $sha512; exitCode = -1; message = 'Installer did not finish' }",
-    "Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] Runner started; waiting for process $parentId\" -Encoding UTF8",
-    "try {",
-    "  $deadline = (Get-Date).AddSeconds(30)",
-    "  while ((Get-Process -Id $parentId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }",
-    "  Start-Sleep -Milliseconds 500",
-    "  Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] Starting installer $installerPath\" -Encoding UTF8",
-    "  $setup = Start-Process -FilePath $installerPath -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden",
-    "  $result.exitCode = $setup.ExitCode",
-    "  if ($setup.ExitCode -eq 0) {",
-    "    $result.status = 'success'",
-    "    $result.message = 'Update installed successfully'",
-    "  } else {",
-    "    $result.message = \"Installer exit code $($setup.ExitCode)\"",
-    "  }",
-    "} catch {",
-    "  $result.message = $_.Exception.Message",
-    "} finally {",
-    "  $resultJson = $result | ConvertTo-Json -Compress",
-    "  $resultJson | Out-File -LiteralPath $resultPath -Encoding UTF8 -Force",
-    "  Add-Content -LiteralPath $logPath -Value \"[$(Get-Date -Format o)] $($result.status): $($result.message); exit code $($result.exitCode)\" -Encoding UTF8",
-    "  if (Test-Path -LiteralPath $appPath) { Start-Process -FilePath $appPath }",
-    "}"
-  ].join("\n");
-  await fs.writeFile(runnerPath, `${script}\n`, "utf8");
-  const runnerArgs = `-NoProfile -ExecutionPolicy Bypass -File "${runnerPath.replace(/"/g, '`"')}"`;
-  const bootstrap = `Start-Process -FilePath 'powershell.exe' -ArgumentList ${quotePowerShellString(runnerArgs)} -WindowStyle Hidden`;
-  const launch = await runProcess(
-    "powershell.exe",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", bootstrap],
-    5000
-  );
-  if (launch.code !== 0) {
-    throw new Error(launch.stderr.trim() || "无法启动更新协调器");
-  }
+  return localUpdateState;
 }
 
 async function installLocalUpdate(): Promise<OperationResult> {
   if (localUpdateInstallInProgress) {
     return {
       ok: true,
-      message: "自动更新安装器已经启动"
+      message: localUpdateState.message,
+      localUpdate: localUpdateState
     };
   }
-
-  const update = await checkLocalUpdate();
-  if (!update.available || !update.installerPath) {
+  if (!supportsOnlineUpdate()) {
     return {
       ok: false,
-      message: update.message,
-      localUpdate: update
+      message: getLocalUpdateState().message,
+      localUpdate: getLocalUpdateState()
     };
   }
+  configureAutoUpdater();
+  if (!localUpdateState.available) {
+    await checkLocalUpdate();
+  }
+  if (!localUpdateState.available) {
+    return { ok: false, message: localUpdateState.message, localUpdate: localUpdateState };
+  }
 
-  await fs.access(update.installerPath);
   localUpdateInstallInProgress = true;
-
-  const config = await readDevUpdateConfig();
-  const release = config ? await readLatestLocalRelease(config) : undefined;
-  const store = await readStore();
-  store.preferences.localUpdate = {
-    ...(store.preferences.localUpdate || {}),
-    pendingSha512: release?.sha512,
-    pendingVersion: update.version,
-    lastInstallStartedAt: nowIso()
-  };
-  await writeStore(store);
-
-  await launchLocalUpdateInstaller(update.installerPath, update.version, release?.sha512);
-  setTimeout(() => quitApp(), 100);
-
-  return {
-    ok: true,
-    message: "已启动自动更新安装器，Codex Switch 将自动退出并安装新版",
-    localUpdate: update
-  };
-}
-
-async function markPendingLocalUpdateInstalled(): Promise<void> {
-  if (!app.isPackaged) {
-    return;
-  }
-  const resultPath = join(app.getPath("userData"), LOCAL_UPDATE_RESULT_FILE);
-  const rawResult = await readTextIfExists(resultPath);
-  if (!rawResult.trim()) {
-    return;
-  }
-  const result = JSON.parse(rawResult.replace(/^\uFEFF/, "")) as LocalUpdateResult;
-  await fs.rm(resultPath, { force: true });
-  const store = await readStore();
-  const preference = store.preferences.localUpdate;
-  if (!preference?.pendingSha512 && !preference?.pendingVersion) {
-    return;
-  }
-
-  const resultMatchesPending =
-    (!preference.pendingVersion || result.version === preference.pendingVersion) &&
-    (!preference.pendingSha512 || result.sha512 === preference.pendingSha512);
-
-  if (result.status !== "success" || !resultMatchesPending) {
-    store.preferences.localUpdate = {
-      ...preference,
-      failedSha512: result.sha512 || preference.pendingSha512,
-      failedAt: nowIso()
+  try {
+    if (localUpdateState.status !== "downloaded") {
+      publishLocalUpdateState({ status: "downloading", available: true, percent: 0, message: "正在下载更新 0%" });
+      await autoUpdater.downloadUpdate();
+    }
+    const result = {
+      ok: true,
+      message: "更新已下载，Codex Switch 将退出、安装新版并重新启动",
+      localUpdate: localUpdateState
     };
-    delete store.preferences.localUpdate.pendingSha512;
-    delete store.preferences.localUpdate.pendingVersion;
-    await writeStore(store);
-    return;
+    setTimeout(() => autoUpdater.quitAndInstall(true, true), 600);
+    return result;
+  } catch (error) {
+    localUpdateInstallInProgress = false;
+    const message = `更新失败：${normalizeError(error)}`;
+    publishLocalUpdateState({ status: "error", available: true, message });
+    return { ok: false, message, localUpdate: localUpdateState };
   }
-
-  const nextPreference: LocalUpdatePreference = {
-    ...preference,
-    installedSha512: preference.pendingSha512 || preference.installedSha512,
-    installedVersion: preference.pendingVersion || app.getVersion()
-  };
-  delete nextPreference.pendingSha512;
-  delete nextPreference.pendingVersion;
-  delete nextPreference.failedSha512;
-  delete nextPreference.failedAt;
-  store.preferences.localUpdate = nextPreference;
-  await writeStore(store);
 }
 
 async function checkAndInstallLocalUpdate(): Promise<void> {
-  if (!app.isPackaged || localUpdateInstallInProgress || process.env.CODEX_SWITCH_DISABLE_AUTO_UPDATE === "1") {
+  if (!supportsOnlineUpdate() || localUpdateInstallInProgress || process.env.CODEX_SWITCH_DISABLE_AUTO_UPDATE === "1") {
     return;
   }
-  const update = await checkLocalUpdate();
-  if (update.available) {
-    await installLocalUpdate();
-  }
+  await checkLocalUpdate();
 }
 
 function scheduleLocalUpdateChecks(): void {
-  if (!app.isPackaged || localUpdateTimer) {
+  if (!supportsOnlineUpdate() || localUpdateTimer) {
     return;
   }
   setTimeout(() => {
@@ -3975,6 +3788,7 @@ function registerIpc(): void {
     updateDynamicEndurance(input)
   );
   ipcMain.handle("codex-switch:run-dynamic-endurance", () => runDynamicEndurance());
+  ipcMain.handle("codex-switch:get-local-update-state", () => getLocalUpdateState());
   ipcMain.handle("codex-switch:check-local-update", () => checkLocalUpdate());
   ipcMain.handle("codex-switch:install-local-update", () => installLocalUpdate());
   ipcMain.handle("codex-switch:restart-codex", () => restartCodexSafely());
@@ -4108,9 +3922,8 @@ if (safeRestartDiagnostic) {
     registerIpc();
     createWindow();
     startDynamicSessionWatcher();
-    void markPendingLocalUpdateInstalled()
-      .catch(() => undefined)
-      .finally(() => scheduleLocalUpdateChecks());
+    configureAutoUpdater();
+    scheduleLocalUpdateChecks();
     setTimeout(() => {
       void runDynamicEnduranceIfEnabled(true);
     }, 1800);

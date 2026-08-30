@@ -4,6 +4,7 @@ export interface CodexConnectionInput {
   authMode?: string;
   hasChatGptToken: boolean;
   hasApiKey: boolean;
+  cliLoginKind?: "chatgpt" | "api" | "none" | "unknown";
   providerName?: string;
   baseUrl?: string;
   authError?: string;
@@ -15,15 +16,23 @@ export interface CodexConnectionDetection {
 }
 
 export function classifyCodexConnection(input: CodexConnectionInput): CodexConnectionDetection {
-  if (input.authError) {
-    return { kind: "error", message: `auth.json 读取失败：${input.authError}` };
-  }
-
-  if (input.baseUrl || input.providerName === "codex_switch" || input.authMode === "apikey" || input.hasApiKey) {
+  if (input.baseUrl || input.providerName === "codex_switch") {
     if (!input.baseUrl) {
       return { kind: "error", message: "检测到 API Key/中转认证，但 config.toml 缺少可用的 base_url" };
     }
     return { kind: "relay", message: `正在使用中转站：${input.baseUrl}` };
+  }
+
+  if (input.cliLoginKind === "chatgpt") {
+    return { kind: "official", message: "正在使用官方 ChatGPT 登录（已由 Codex CLI 验证）" };
+  }
+
+  if (input.authMode === "apikey" || input.hasApiKey) {
+    return { kind: "error", message: "检测到 API Key/中转认证，但 config.toml 缺少可用的 base_url" };
+  }
+
+  if (input.authError) {
+    return { kind: "error", message: `auth.json 读取失败：${input.authError}` };
   }
 
   if (input.authMode === "chatgpt") {

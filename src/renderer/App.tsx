@@ -15,6 +15,7 @@ import {
   CopySimple,
   CurrencyCircleDollar,
   Database,
+  DownloadSimple,
   Eye,
   EyeSlash,
   FloppyDisk,
@@ -57,6 +58,7 @@ import type {
   CodexSwitchApi,
   DynamicEnduranceSettings,
   DynamicEnduranceStrategy,
+  LocalUpdateInfo,
   OperationResult,
   BackupRecord,
   ProfileTag,
@@ -166,6 +168,7 @@ function App(): ReactElement {
   const [editForm, setEditForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState<BusyAction>("loading");
   const [usageRefreshing, setUsageRefreshing] = useState(false);
+  const [localUpdate, setLocalUpdate] = useState<LocalUpdateInfo | null>(null);
   const [testingProfileId, setTestingProfileId] = useState<string | null>(null);
   const [connectingDashboardProfileId, setConnectingDashboardProfileId] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
@@ -189,6 +192,11 @@ function App(): ReactElement {
   useEffect(() => {
     void bootstrapState();
   }, []);
+
+  useEffect(() => {
+    void api.getLocalUpdateState().then(setLocalUpdate).catch(() => undefined);
+    return api.onLocalUpdateState(setLocalUpdate);
+  }, [api]);
 
   useEffect(() => {
     if (activeView !== "profile-file") {
@@ -276,6 +284,21 @@ function App(): ReactElement {
     } finally {
       setUsageRefreshing(false);
     }
+  }
+
+  async function handleInstallUpdate(): Promise<void> {
+    if (!localUpdate?.available || localUpdate.status === "downloading") {
+      return;
+    }
+    const result = await api.installLocalUpdate();
+    if (result.localUpdate) {
+      setLocalUpdate(result.localUpdate);
+    }
+    showToast({
+      tone: result.ok ? "info" : "warn",
+      title: result.ok ? "正在安装更新" : "更新失败",
+      detail: result.message
+    });
   }
 
   function addLog(entry: Omit<LogEntry, "id">): void {
@@ -859,6 +882,17 @@ function App(): ReactElement {
                   </div>
                 </div>
                 <div className="subscriptions-tools">
+                  {localUpdate?.available && (
+                    <button
+                      className={`app-update-button ${localUpdate.status === "downloading" ? "downloading" : ""}`}
+                      onClick={() => void handleInstallUpdate()}
+                      disabled={localUpdate.status === "downloading" || localUpdate.status === "downloaded"}
+                      title={localUpdate.message}
+                      aria-label={localUpdate.version ? `更新 Codex Switch 到 ${localUpdate.version}` : "更新 Codex Switch"}
+                    >
+                      <DownloadSimple size={20} weight="bold" />
+                    </button>
+                  )}
                   <button
                     className="sync-usage-button"
                     onClick={() => void refreshUsage(true)}
@@ -969,6 +1003,7 @@ function App(): ReactElement {
                     <div>
                       <h2>动态续航</h2>
                       <p>{dynamicEndurance.enabled ? "已启用" : "已关闭"}</p>
+                      <small className="experimental-note">目前动态续航仍在测试中，谨慎使用</small>
                     </div>
                     <button
                       className={`switch-toggle ${dynamicEndurance.enabled ? "on" : ""}`}

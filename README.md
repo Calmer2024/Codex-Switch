@@ -11,7 +11,7 @@ Codex Switch 是一个面向 Windows 的 Codex 中转站配置管理工具。它
 - **额度同步**：支持中转站余额/额度与官方 Codex 使用窗口同步；可连接支持网页登录态的中转站。
 - **动态续航**：按经济或质量策略，从可用配置中自动选择更合适的中转站。
 - **备份恢复**：查看、恢复和清理历史 Codex 配置备份。
-- **本地更新**：支持生成本地更新通道、检查新版本并通过安装器静默更新。
+- **在线更新**：通过 GitHub Releases 检查新版本，用户点击更新按钮后下载、校验并安装新版。
 
 ## 界面说明
 
@@ -62,6 +62,25 @@ npm run dist:install
 ```
 
 安装产物默认输出到 `release/`。该目录已加入 `.gitignore`，不会进入 Git 提交。
+
+## 发布与 Windows 代码签名
+
+正式版本通过 `.github/workflows/release-windows.yml` 构建并发布到 GitHub Releases。当前流程不使用代码签名证书，直接发布未签名的 Windows EXE。
+
+如果未来启用代码签名，可在仓库的 `Settings → Secrets and variables → Actions` 中配置：
+
+- `WINDOWS_CERTIFICATE_BASE64`：受信任 CA 签发的 Windows 代码签名 `.pfx` 文件的 Base64 内容；
+- `WINDOWS_CERTIFICATE_PASSWORD`：该 `.pfx` 文件的密码。
+
+PowerShell 可使用以下命令生成证书 Secret 内容：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\to\codex-switch-signing.pfx'))
+```
+
+将版本号更新后推送匹配的标签，例如 `v1.0.13`，工作流会运行测试、生成 NSIS 安装包，并上传 EXE、`latest.yml` 和 blockmap。
+
+OV 证书可以显示可信发布者，但新证书仍需要积累 SmartScreen 信誉；如果要求首次发布就尽量避免 SmartScreen 信誉提示，应选择 EV 代码签名证书或 Microsoft Trusted Signing。
 
 ## 数据与安全
 

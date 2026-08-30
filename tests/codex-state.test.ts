@@ -6,6 +6,14 @@ test("recognises a real official ChatGPT login shape", () => {
   assert.equal(classifyCodexConnection({ authMode: "chatgpt", hasChatGptToken: true, hasApiKey: false }).kind, "official");
 });
 
+test("recognises a keyring-backed official login reported by the Codex CLI", () => {
+  assert.equal(classifyCodexConnection({ hasChatGptToken: false, hasApiKey: false, cliLoginKind: "chatgpt" }).kind, "official");
+});
+
+test("prefers the authoritative CLI login over a stale API-key auth file", () => {
+  assert.equal(classifyCodexConnection({ authMode: "apikey", hasChatGptToken: false, hasApiKey: true, cliLoginKind: "chatgpt" }).kind, "official");
+});
+
 test("recognises a Codex Switch relay even when auth.json still contains ChatGPT credentials", () => {
   assert.equal(classifyCodexConnection({ authMode: "chatgpt", hasChatGptToken: true, hasApiKey: false, providerName: "codex_switch", baseUrl: "https://relay.example/v1" }).kind, "relay");
 });

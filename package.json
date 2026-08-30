@@ -1,6 +1,6 @@
 {
   "name": "codex-switch",
-  "version": "1.0.11",
+  "version": "1.0.13",
   "description": "A Windows desktop tool for switching Codex relay configurations.",
   "author": "Codex Switch",
   "private": true,
@@ -14,15 +14,17 @@
     "stop:local-app": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-installed-app.ps1",
     "clean:release": "node scripts/clean-release.mjs",
     "prune:release": "node scripts/prune-release.mjs",
-    "prepare:local-update": "node scripts/write-dev-update-config.mjs",
-    "dist": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win nsis portable && npm run prune:release",
-    "dist:installer": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win nsis && npm run prune:release",
-    "dist:portable": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --win portable && npm run prune:release",
+    "dist": "npm run clean:release && npm run build && electron-builder --win nsis portable --publish never && npm run prune:release",
+    "dist:installer": "npm run clean:release && npm run build && electron-builder --win nsis --publish never && npm run prune:release",
+    "dist:portable": "npm run clean:release && npm run build && electron-builder --win portable --publish never && npm run prune:release",
+    "release:win": "npm run dist:installer",
     "dist:install": "npm run stop:local-app && npm run dist:installer && powershell -NoProfile -ExecutionPolicy Bypass -Command \"$installer = Join-Path (Resolve-Path .\\release) ('Codex-Switch-Setup-' + $env:npm_package_version + '.exe'); if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer not found' }; $process = Start-Process -FilePath $installer -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden; if ($process.ExitCode -ne 0) { throw ('Installer failed with exit code ' + $process.ExitCode) }\"",
-    "pack": "npm run clean:release && npm run prepare:local-update && npm run build && electron-builder --dir"
+    "pack": "npm run clean:release && npm run build && electron-builder --dir"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
     "lucide-react": "^0.468.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
@@ -53,23 +55,24 @@
       {
         "from": "build/icon.ico",
         "to": "icon.ico"
-      },
-      {
-        "from": "build/dev-update.json",
-        "to": "dev-update.json"
       }
     ],
+    "publish": {
+      "provider": "github",
+      "owner": "Calmer2024",
+      "repo": "Codex-Switch"
+    },
     "win": {
       "icon": "build/icon.ico",
       "target": [
         "nsis",
         "portable"
-      ],
-      "signExecutable": false
+      ]
     },
     "nsis": {
       "artifactName": "Codex-Switch-Setup-${version}.${ext}",
-      "oneClick": true,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
       "perMachine": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
