@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
+import { app, BrowserWindow, ipcMain, net, safeStorage, shell } from "electron";
 import type { WebContents } from "electron";
 import electronLog from "electron-log/main";
 import electronUpdater from "electron-updater";
@@ -2724,6 +2724,44 @@ function parseOfficialUsagePayload(payload: unknown): ProfileUsageSummary | unde
   return undefined;
 }
 
+function requestOfficialUsage(headers: Record<string, string>): Promise<{ statusCode: number; statusMessage?: string; body: string }> {
+  return new Promise((resolve, reject) => {
+    const request = net.request({
+      method: "GET",
+      url: OFFICIAL_USAGE_ENDPOINT,
+      headers
+    });
+    const timeout = setTimeout(() => {
+      request.abort();
+      const error = new Error("官方额度接口暂时无响应");
+      error.name = "AbortError";
+      reject(error);
+    }, OFFICIAL_USAGE_TIMEOUT_MS);
+    const chunks: Buffer[] = [];
+
+    request.on("response", (response) => {
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => {
+        clearTimeout(timeout);
+        resolve({
+          statusCode: response.statusCode,
+          statusMessage: response.statusMessage,
+          body: Buffer.concat(chunks).toString("utf8")
+        });
+      });
+      response.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+    request.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    request.end();
+  });
+}
+
 async function fetchOfficialUsage(store: StoreFile): Promise<ProfileUsageSummary> {
   const { authPath } = paths();
   const auth = parseCodexAuthFileOrEmpty(await readTextIfExists(authPath));
@@ -2748,31 +2786,23 @@ async function fetchOfficialUsage(store: StoreFile): Promise<ProfileUsageSummary
 
   let lastMessage = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), OFFICIAL_USAGE_TIMEOUT_MS);
     try {
-      const response = await fetch(OFFICIAL_USAGE_ENDPOINT, {
-        method: "GET",
-        headers,
-        signal: controller.signal
-      });
-      if (!response.ok) {
-        lastMessage = `官方额度接口返回 ${response.status} ${response.statusText || ""}`.trim();
-        if (usingCachedToken && (response.status === 401 || response.status === 403)) {
+      const response = await requestOfficialUsage(headers);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        lastMessage = `官方额度接口返回 ${response.statusCode} ${response.statusMessage || ""}`.trim();
+        if (usingCachedToken && (response.statusCode === 401 || response.statusCode === 403)) {
           delete store.preferences.officialUsageAuth;
           return createUsageSummary("official", "unsupported", "官方余量", "登录已失效", "请切换到官方配置并重新登录", OFFICIAL_USAGE_ENDPOINT);
         }
         continue;
       }
-      const payload = await response.json();
+      const payload = JSON.parse(response.body) as unknown;
       return (
         parseOfficialUsagePayload(payload) ||
         createUsageSummary("official", "unsupported", "官方余量", "未返回", "官方接口未返回可识别的额度窗口", OFFICIAL_USAGE_ENDPOINT)
       );
     } catch (error) {
       lastMessage = error instanceof Error && error.name === "AbortError" ? "官方额度接口暂时无响应" : normalizeError(error);
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
