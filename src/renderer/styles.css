@@ -2216,8 +2216,13 @@ button:disabled {
 }
 
 .subscription-card.builtin {
+  grid-template-rows: 44px 84px 44px minmax(100px, 1fr) 0 30px 30px;
   border-color: #dbe5ff;
   background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.subscription-card.builtin .subscription-tag-row {
+  display: none;
 }
 
 .subscription-card.active {

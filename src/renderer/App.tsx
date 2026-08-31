@@ -1680,9 +1680,7 @@ function SubscriptionCard({
       <UsagePanel usage={profile.usage} isOfficial={isOfficial} />
 
       <div className="subscription-tag-row">
-        {isOfficial ? (
-          <em>内置官方配置，不参与评分标签</em>
-        ) : (
+        {!isOfficial && (
           <>
             <ProfileTagList tagIds={profile.tagIds} tags={tags} />
             {!profile.tagIds.length && <em>未设置标签</em>}
