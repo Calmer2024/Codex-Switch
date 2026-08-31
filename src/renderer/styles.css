@@ -2172,7 +2172,7 @@ button:disabled {
   isolation: isolate;
   overflow: hidden;
   display: grid;
-  grid-template-rows: 44px 84px 44px minmax(60px, auto) 26px 30px 30px;
+  grid-template-rows: 44px 84px 44px minmax(60px, 1fr) 26px 30px 30px;
   gap: 8px;
   min-width: 0;
   min-height: 430px;
@@ -2663,9 +2663,11 @@ button:disabled {
 
 .subscription-usage-panel {
   display: grid;
+  align-content: start;
   gap: 6px;
   min-width: 0;
-  min-height: 60px;
+  min-height: 0;
+  overflow: hidden;
   padding: 8px 9px;
   border: 1px solid #ececef;
   border-radius: 7px;
@@ -2752,6 +2754,7 @@ button:disabled {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
 }
 
 .usage-window-row span {
@@ -2775,6 +2778,7 @@ button:disabled {
 .usage-window-row small {
   color: #8b919c;
   font-size: 8px;
+  line-height: 1.1;
 }
 
 .usage-window-meter {
