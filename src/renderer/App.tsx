@@ -22,7 +22,6 @@ import {
   FolderOpen,
   FunnelSimple,
   Gauge,
-  GearSix,
   Key,
   LinkSimple,
   Lightning,
@@ -207,6 +206,12 @@ function App(): ReactElement {
       setProfileFileError(error instanceof Error ? error.message : String(error));
     });
   }, [activeView, api, profileFileRevision]);
+
+  useEffect(() => {
+    if (activeView === "settings") {
+      setActiveView("profiles");
+    }
+  }, [activeView]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -806,9 +811,6 @@ function App(): ReactElement {
           </button>
           <button className={activeView === "backups" ? "active" : ""} onClick={() => setActiveView("backups")} title="备份恢复">
             <ClockCounterClockwise size={19} weight={activeView === "backups" ? "fill" : "regular"} />
-          </button>
-          <button className={activeView === "settings" ? "active" : ""} onClick={() => setActiveView("settings")} title="设置">
-            <GearSix size={19} weight={activeView === "settings" ? "fill" : "regular"} />
           </button>
         </nav>
         <div className="rail-bottom">
