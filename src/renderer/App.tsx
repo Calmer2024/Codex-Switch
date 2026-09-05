@@ -460,11 +460,10 @@ function App(): ReactElement {
         });
       } else if (result.ok && result.restart) {
         showToast({
-          tone: "info",
-          title: "配置已安全保存",
+          tone: result.restart.status === "restarted" ? "ok" : "info",
+          title: result.restart.status === "restarted" ? "配置已生效" : "配置已保存",
           detail: result.restart.message
         });
-        setRestartPromptOpen(true);
       }
     } finally {
       setBusy(null);
@@ -504,14 +503,14 @@ function App(): ReactElement {
       const restarted = await api.restartCodex();
       const restartStatus = restarted.restart?.status;
       const restartTitle = restartStatus === "restarted"
-        ? "Codex 已安全重启"
+        ? "Codex 已强制重启"
         : restartStatus === "not-running"
           ? "Codex 当前未运行"
           : restartStatus === "cancelled-active-task"
             ? "检测到活动任务，已取消重启"
             : restartStatus === "refused"
               ? "Codex 拒绝安全退出"
-              : "安全重启失败";
+              : "强制重启失败";
       showToast({
         tone: restartStatus === "restarted" ? "ok" : restartStatus === "not-running" ? "info" : "warn",
         title: restartTitle,
@@ -1245,13 +1244,13 @@ function App(): ReactElement {
             <span className="restart-modal-icon"><ArrowClockwise size={22} /></span>
             <div>
               <h2 id="restart-modal-title">配置已经保存</h2>
-              <p>安全重启仅作用于 Codex 桌面端。检测到正在运行的任务时会自动取消，不会强制结束进程；IDE 扩展从新任务读取配置。</p>
+              <p>将立即强制关闭并重新启动 Codex，正在运行的任务可能中断。配置会在重启后生效。</p>
             </div>
             <div className="restart-modal-actions">
               <button className="secondary-action" onClick={() => setRestartPromptOpen(false)}>稍后生效</button>
               <button className="primary-action" onClick={() => void handleSafeRestart()}>
                 <ArrowClockwise size={17} />
-                安全重启
+                立即重启
               </button>
             </div>
           </section>

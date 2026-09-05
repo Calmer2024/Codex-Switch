@@ -3414,34 +3414,25 @@ async function performCodexRestart(beforeSignature: string, afterSignature: stri
     };
   }
 
-  // Never terminate Codex processes here. A backend may be executing a tool call;
-  // force-stopping it makes the desktop app report a 0xFFFFFFFF crash.
-  return {
-    status: "deferred",
+  const result = await restartCodexForcefully();
+  return result.restart || {
+    status: result.ok ? "restarted" : "failed",
     needed: true,
-    attempted: false,
-    restarted: false,
+    attempted: true,
+    restarted: result.ok,
     processCount: 0,
-    message: "配置已保存；为保护正在运行的任务，不会强制重启 Codex，新任务或下次启动时生效"
+    message: result.message
   };
 
 }
 
-async function restartCodexSafely(): Promise<OperationResult> {
+async function restartCodexForcefully(): Promise<OperationResult> {
   if (process.platform !== "win32") {
-    return { ok: false, message: "当前平台暂不支持应用内安全重启 Codex" };
+    return { ok: false, message: "当前平台暂不支持应用内强制重启 Codex" };
   }
   const script = `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$sessionsRoot = Join-Path $HOME '.codex\\sessions'
-$latestSession = Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
-  Sort-Object LastWriteTimeUtc -Descending |
-  Select-Object -First 1
-if ($latestSession -and $latestSession.LastWriteTimeUtc -gt (Get-Date).ToUniversalTime().AddSeconds(-12)) {
-  @{ ok = $false; status = 'cancelled-active-task'; processCount = 0; message = '检测到 Codex 任务仍在活动，已取消重启；配置将在新任务中生效' } | ConvertTo-Json -Compress
-  exit 0
-}
 $ideHosts = @(Get-CimInstance Win32_Process | Where-Object {
   $_.Name -eq 'codex.exe' -and
   $_.CommandLine -match 'app-server' -and
@@ -3458,35 +3449,26 @@ if ($main.Count -eq 0) {
   exit 0
 }
 $exe = $main[0].ExecutablePath
-$process = Get-Process -Id $main[0].ProcessId -ErrorAction Stop
-$requested = $process.CloseMainWindow()
-if (-not $requested) {
-  @{ ok = $false; status = 'refused'; processCount = 1; message = 'Codex 未接受安全关闭请求；未强制结束进程，请手动关闭后重新打开' } | ConvertTo-Json -Compress
-  exit 0
-}
-$deadline = (Get-Date).AddSeconds(12)
-while ((Get-Process -Id $process.Id -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
-  Start-Sleep -Milliseconds 150
-}
-if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
-  @{ ok = $false; status = 'refused'; processCount = 1; message = 'Codex 正在处理任务或拒绝退出；未强制结束进程' } | ConvertTo-Json -Compress
+& taskkill.exe /PID $main[0].ProcessId /T /F *> $null
+if ($LASTEXITCODE -ne 0) {
+  @{ ok = $false; status = 'failed'; processCount = 1; message = '强制关闭 Codex 进程失败' } | ConvertTo-Json -Compress
   exit 0
 }
 Start-Process -FilePath $exe
 if ($ideHosts.Count -gt 0) {
-  @{ ok = $true; status = 'restarted'; processCount = 1; message = "Codex 桌面端已安全重启；检测到 $($ideHosts.Count) 个 IDE Codex 后台，它们将在新任务中读取配置" } | ConvertTo-Json -Compress
+  @{ ok = $true; status = 'restarted'; processCount = 1; message = "Codex 桌面端已强制重启；检测到 $($ideHosts.Count) 个 IDE Codex 后台" } | ConvertTo-Json -Compress
 } else {
-  @{ ok = $true; status = 'restarted'; processCount = 1; message = 'Codex 桌面端已安全重启，新配置已生效' } | ConvertTo-Json -Compress
+  @{ ok = $true; status = 'restarted'; processCount = 1; message = 'Codex 桌面端已强制重启，新配置已生效' } | ConvertTo-Json -Compress
 }
 `;
   const result = await runProcess("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], 16000);
   if (result.code !== 0) {
-    const message = result.stderr.trim() || "安全重启 Codex 失败";
+    const message = result.stderr.trim() || "强制重启 Codex 失败";
     return { ok: false, message, restart: { status: "failed", needed: true, attempted: true, restarted: false, processCount: 0, message } };
   }
   try {
     const parsed = JSON.parse(result.stdout.trim()) as { ok?: boolean; status?: CodexRestartResult["status"]; processCount?: number; message?: string };
-    const message = parsed.message || "安全重启操作已完成";
+    const message = parsed.message || "强制重启操作已完成";
     const status = parsed.status || (parsed.ok ? "restarted" : "failed");
     return {
       ok: Boolean(parsed.ok),
@@ -3501,7 +3483,7 @@ if ($ideHosts.Count -gt 0) {
       }
     };
   } catch {
-    const message = "安全重启 Codex 的结果无法解析";
+    const message = "强制重启 Codex 的结果无法解析";
     return { ok: false, message, restart: { status: "failed", needed: true, attempted: true, restarted: false, processCount: 0, message } };
   }
 }
@@ -3821,7 +3803,7 @@ function registerIpc(): void {
   ipcMain.handle("codex-switch:get-local-update-state", () => getLocalUpdateState());
   ipcMain.handle("codex-switch:check-local-update", () => checkLocalUpdate());
   ipcMain.handle("codex-switch:install-local-update", () => installLocalUpdate());
-  ipcMain.handle("codex-switch:restart-codex", () => restartCodexSafely());
+  ipcMain.handle("codex-switch:restart-codex", () => restartCodexForcefully());
   ipcMain.handle("codex-switch:restore-backup", (_event, backupId: string) => restoreBackup(backupId));
   ipcMain.handle("codex-switch:delete-backups", (_event, backupIds: string[]) => deleteBackups(backupIds));
   ipcMain.handle("codex-switch:reveal-path", async (_event, kind: "codexHome" | "storage" | "backupRoot") => {
@@ -3895,7 +3877,7 @@ const hasSingleInstanceLock = providerTokenProfileId || realChainDiagnostic || s
 
 if (safeRestartDiagnostic) {
   app.whenReady()
-    .then(() => restartCodexSafely())
+    .then(() => restartCodexForcefully())
     .then((result) => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .then(() => app.exit(0))
     .catch((error) => {
